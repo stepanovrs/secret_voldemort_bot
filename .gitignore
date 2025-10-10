@@ -25,3 +25,8 @@ build/
 
 # Docker/Compose
 *.local.yml
+
+# secrets
+.env
+.env.*
+Bot Token.txt
