@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+.venv/
+venv/
+.env
+.env.*
+.env.local
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs, cache
+*.log
+.cache/
+dist/
+build/
+
+# Docker/Compose
+*.local.yml
