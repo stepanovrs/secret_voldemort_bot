@@ -1,13 +1,10 @@
 # Python
-__pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 *.so
 *.egg-info/
 *.egg
-.venv/
-venv/
 .env
 .env.*
 .env.local

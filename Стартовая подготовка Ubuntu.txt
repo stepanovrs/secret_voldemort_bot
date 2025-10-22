@@ -1,0 +1,2 @@
+sudo apt-get update && sudo apt-get install -y python3.12 python3.12-venv && \
+python3.12 -m pip install -U aiogram SQLAlchemy aiosqlite openpyxl python-dotenv tzdata

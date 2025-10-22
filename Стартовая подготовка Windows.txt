@@ -1,0 +1,2 @@
+winget install -e --id Python.Python.3.12 ; `
+py -3.12 -m pip install -U aiogram SQLAlchemy aiosqlite openpyxl python-dotenv tzdata

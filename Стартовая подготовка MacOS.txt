@@ -1,0 +1,2 @@
+brew install python@3.12 && \
+python3.12 -m pip install -U aiogram SQLAlchemy aiosqlite openpyxl python-dotenv tzdata
