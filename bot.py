@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import json
+import re
 import tempfile
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timedelta, timezone
@@ -25,7 +26,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import desc, select
 
-from config import BOT_TOKEN, MAX_BLUE, is_admin
+from config import BOT_TOKEN, MAX_BLUE, is_admin, ENABLE_ADMIN_CREATE_PLAYER
 from db import (
     Player,
     Game,
@@ -39,21 +40,103 @@ from db import (
     init_db,
     list_all_games,
     update_player_name,
+    create_purchase,
+    list_purchases,
+    set_purchase_received,
 )
+
 from services import (
     apply_ratings,
     get_team_rosters,
+    recompute_all_galleons,
     recompute_all_ratings,
     search_players,
     set_result_type_and_killer,
     set_voldemort,
     set_team_roster,
     validate_rosters,
+    get_player_streaks,
 )
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+# ===================== Patches / helpers =====================
+# Safer answer for old callback queries (ignores 'query is too old' / invalid ID)
+async def safe_answer(c: CallbackQuery, *args, **kwargs):
+    try:
+        return await c.answer(*args, **kwargs)
+    except TelegramBadRequest as e:
+        msg = str(e).lower()
+        if 'query is too old' in msg or 'query id is invalid' in msg or 'timeout expired' in msg:
+            return
+        # игнорируем "Bad Request: message can't be edited" и подобные не критичные
+        if 'bad request' in msg:
+            return
+        raise
+    except Exception:
+        return
+
+# Make admin check tolerant to case and '@' and fallback to ADMIN_USERNAMES from .env
+try:
+    _is_admin_base = is_admin  # from config
+except Exception:
+    async def _is_admin_base(*_args, **_kwargs):
+        return False
+
+def is_admin(user_id: int, username: Optional[str]) -> bool:  # type: ignore[override]
+    try:
+        if _is_admin_base(user_id, username):  # if config says admin — trust it
+            return True
+    except Exception:
+        pass
+    uname = (username or "").strip().lstrip("@").lower()
+    env_val = os.getenv("ADMIN_USERNAMES", "") or ""
+    # allow comma/semicolon separated values with/without '@' and arbitrary spaces
+    env_names = [x.strip().lstrip("@").lower() for x in re.split(r"[;,]", env_val) if x.strip()]
+    return bool(uname and uname in env_names)
+
+
+# ===================== Shop / Galleons =====================
+COIN = "💰"
+
+SHOP_ITEMS = [
+    {"code": "pm_first_game", "label": "Заявиться первым министром в 1-й игре", "title": "Заявиться первым министром в первой игре вечера (до раздачи ролей)", "cost": 5, "emoji": "👑"},
+    {"code": "pm_replace_lord", "label": "Заявиться первым министром (смещение лорда)", "title": "Заявиться первым министром сместив прошлого лорда", "cost": 15, "emoji": "🛡️"},
+    {"code": "badge", "title": "Фирменный значок", "cost": 100, "emoji": "🏷️"},
+    {"code": "random_12_rooms", "title": "Случайный сертификат 12 комнат", "cost": 300, "emoji": "🎟️"},
+    {"code": "named_ballot", "title": "Именная голосовалка", "cost": 300, "emoji": "🗳️"},
+]
+
+def _msk_now_str() -> str:
+    return datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S (МСК)")
+
+def shop_menu_kb():
+    kb = InlineKeyboardBuilder()
+    for item in SHOP_ITEMS:
+        kb.button(text=f"{item['emoji']} {item.get('label', item['title'])} — {item['cost']}{COIN}", callback_data=f"shop:buy:{item['code']}")
+    kb.button(text="⬅️ Назад", callback_data="backhome")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def mypurchases_list_kb(purchases: list):
+    kb = InlineKeyboardBuilder()
+    for p in purchases:
+        mark = "✅" if p.is_received else "❌"
+        kb.button(text=f"{mark} {p.title} — {p.cost}{COIN} • {p.created_at.strftime('%d.%m %H:%M')} ", callback_data=f"mypur:item:{p.id}")
+    kb.button(text="⬅️ Назад", callback_data="backhome")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def purchase_status_kb(purchase_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Получено ✅", callback_data=f"mypur:set:{purchase_id}:1")
+    kb.button(text="Не получено ❌", callback_data=f"mypur:set:{purchase_id}:0")
+    kb.button(text="⬅️ Назад", callback_data="mypur:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
 
 # ===================== small helpers =====================
 # ---- Guard: warn when leaving unfinished game creation ----
@@ -85,7 +168,7 @@ async def _maybe_warn_unfinished(c: CallbackQuery, state: FSMContext, target: st
         return False
     txt = "Состав команд не заполнен — при выходе он будет сброшен и игра не будет записана.\nПерейти в другой раздел?"
     await safe_edit(c.message, txt, reply_markup=confirm_leave_kb(gid, target))
-    await c.answer()
+    await safe_answer(c, )
     return True
 
 def full_name(p: Player) -> str:
@@ -106,6 +189,36 @@ async def safe_edit(message, text, **kwargs):
             return message
         raise
 
+
+def _strip_repeat_summary(summary: str) -> str:
+    """
+    Удаляет дублирующийся блок "Игра завершена./Победа .../Средний MMR .../Фаворит матча ..."
+    из текста, возвращаемого apply_ratings(), чтобы не было повтора в финальном сообщении.
+    """
+    lines = []
+    skip = False
+    for raw in (summary or "").splitlines():
+        s = raw.strip()
+        if s.startswith("Игра завершена."):
+            skip = True
+            continue
+        if skip and (s.startswith("Победа ") or s.startswith("Средний MMR") or s.startswith("Фаворит матча")):
+            continue
+        if skip and (s.startswith("Изменение MMR")):
+            skip = False
+        lines.append(raw)
+    text = "\n".join(lines).strip()
+    return text
+
+def _normalize_summary_delta(summary: str) -> str:
+    """Оставляет из summary только строку с дельтой MMR и
+    переименовывает Синие/Красные в Орден/Пожиратели.
+    """
+    if not summary:
+        return ""
+    text = summary.replace("Синие", "Орден").replace("Красные", "Пожиратели")
+    i = text.find("Изменение MMR")
+    return text[i:].strip() if i != -1 else text.strip()
 def roster_block(title: str, players: List[Player], vold: Optional[Player]) -> str:
     def line(p: Player) -> str:
         tag = " (Воланд)" if (vold and p.id == vold.id) else ""
@@ -113,10 +226,23 @@ def roster_block(title: str, players: List[Player], vold: Optional[Player]) -> s
     body = "\n".join(line(p) for p in players) if players else "—"
     return f"{title} ({len(players)}):\n{body}"
 
+
 async def roster_summary(session: Session, game_id: int) -> Tuple[str, List[Player], List[Player], Optional[Player]]:
     blue, red, vold = await get_team_rosters(session, game_id)
-    ok, msg = validate_rosters(blue, red, vold)
-    text = f"{roster_block('🟦 Орден Феникса', blue, vold)}\n\n{roster_block('🟪 Пожиратели + Воландеморт', red, vold)}\n\nСтатус: {('✅' if ok else '❌')} {msg}"
+    ok, msg = await validate_rosters(blue, red, vold)
+    blue_block = roster_block('🟦 Орден Феникса', blue, vold)
+    red_block = roster_block('🟪 Пожиратели + Воландеморт', red, vold)
+    # Показываем Воландеморта отдельно в красном блоке,
+    # если он выбран, но не находится в списке red.
+    if vold and all(p.id != vold.id for p in red):
+        suffix = f"- {full_name(vold)} [{vold.rating}] (Воланд)"
+        # red_block имеет вид: "Заголовок\nТело"
+        parts = red_block.split("\n", 1)
+        title = parts[0]
+        body = parts[1] if len(parts) > 1 else "—"
+        body = suffix if body.strip() == "—" else body + "\n" + suffix
+        red_block = title + "\n" + body
+    text = f"{blue_block}\n\n{red_block}\n\nСтатус: {('✅' if ok else '❌')} {msg}"
     return text, blue, red, vold
 
 RESULT_HUMAN = {
@@ -340,6 +466,7 @@ class CreateGameFSM(StatesGroup):
 
 class AdminFSM(StatesGroup):
     wait_new_fullname = State()
+    wait_new_player = State()
 
 class UserAuthFSM(StatesGroup):
     wait_name = State()
@@ -354,6 +481,10 @@ def home_kb_for_user(is_admin_flag: bool, is_authorized: bool):
     kb.button(text="🏆 Рейтинг игроков", callback_data="rating:menu")
     if is_authorized:
         kb.button(text="📊 Моя статистика", callback_data="me:stats")
+        kb.button(text=f"{COIN} Мои Галлеоны", callback_data="me:galleons")
+        kb.button(text="📈 Win/lose-streak", callback_data="me:streak")
+        kb.button(text="🛒 Лавка Олливандера", callback_data="shop:menu")
+        kb.button(text="🧾 Мои покупки", callback_data="mypur:menu")
     kb.button(text="❓ FAQ", callback_data="faq")
     if not is_authorized:
         if is_admin_flag:
@@ -405,6 +536,7 @@ def admin_menu_kb():
     kb.button(text="🧑‍🤝‍🧑 Игроки (редакт/удал.)", callback_data="admin:players")
     kb.button(text="🎮 Игры (удаление)", callback_data="admin:games")
     kb.button(text="🔁 Пересчитать рейтинг (все)", callback_data="admin:recompute")
+    kb.button(text=f"{COIN} Перерасчет Галлеонов", callback_data="admin:recompute_galleons")
     kb.button(text="📋 Список дня", callback_data="admin:daylist")
     kb.button(text=inbox_text, callback_data="admin:apps")
     kb.button(text="📈 Статистика бота", callback_data="botstats:menu")
@@ -489,23 +621,23 @@ def daylist_kb(all_players: List[Player], ids: List[int]):
 async def admin_daylist(c: CallbackQuery):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     async with Session() as session:
         res = await session.execute(select(Player).order_by(Player.first_name.asc(), Player.last_name.asc()))
         all_players = list(res.scalars().all())
     ids = _load_day_list()
     await safe_edit(c.message, "Настройка «Списка дня». Отметьте игроков и нажмите «Сохранить список».", reply_markup=daylist_kb(all_players, ids))
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("day:toggle:"))
 async def day_toggle(c: CallbackQuery):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     try:
         pid = int(c.data.split(":")[2])
     except Exception:
-        await c.answer(); return
+        await safe_answer(c, ); return
     ids = _load_day_list()
     if pid in ids:
         ids = [i for i in ids if i != pid]
@@ -522,43 +654,67 @@ async def day_toggle(c: CallbackQuery):
         res = await session.execute(select(Player).order_by(Player.first_name.asc(), Player.last_name.asc()))
         all_players = list(res.scalars().all())
     await safe_edit(c.message, "Настройка «Списка дня». Отметьте игроков и нажмите «Сохранить список».", reply_markup=daylist_kb(all_players, ids))
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data == "day:clear")
 async def day_clear(c: CallbackQuery):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     _save_day_list([])
     async with Session() as session:
         res = await session.execute(select(Player).order_by(Player.first_name.asc(), Player.last_name.asc()))
         all_players = list(res.scalars().all())
     await safe_edit(c.message, "Список дня очищен.", reply_markup=daylist_kb(all_players, []))
-    await c.answer("Очищено.")
+    await safe_answer(c, "Очищено.")
 
 @dp.callback_query(F.data == "day:save")
 async def day_save(c: CallbackQuery):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     # ничего не делаем: список уже сохранён на каждом клике, просто сообщаем
-    await c.answer("Сохранено.")
+    await safe_answer(c, "Сохранено.")
 
 # ===================== start / faq =====================
 FAQ_TEXT = (
-    "❓ *FAQ*\n\n"
-    "Просьба не путать очки общего рейтинга *(MMR — изначально у каждого 3000 MMR)* и *социальные очки* "
-    "для выявления лучшего синего/красного/Воланда *(изначально у всех 0 очков)*.\n\n"
-    "1) *Как бот определяет рейтинги команд и кто сильнее?* — по *среднему MMR* игроков в команде.\n"
-    "2) *Если команда A намного сильнее команды B?* — при большой разнице сильная команда при победе получает меньше MMR, при поражении теряет больше.\n"
-    "3) *Социальные очки* — начисляются только победившей стороне согласно исходу матча.\n\n"
-    "*Правила расчёта MMR (дельты)*\n"
-    "• Разница средних *100–250*: обе команды ±25.\n"
-    "• *251–500*: сильная +23/−28; слабая +28/−23.\n"
-    "• *501–1000*: сильная +20/−30; слабая +30/−20.\n"
-    "• *≥1001*: сильная +15/−35; слабая +35/−15.\n"
-)
+"""❓ *FAQ*
 
+Просьба не путать очки общего рейтинга *(MMR — изначально у каждого 3000 MMR)* и *социальные очки* для выявления лучшего синего/красного/Воланда *(изначально у всех 0 очков)*.
+
+1) *Как бот определяет рейтинги команд и кто сильнее?* — по *среднему MMR* игроков в команде.
+2) *Если команда A намного сильнее команды B?* — при большой разнице сильная команда при победе получает меньше MMR, при поражении теряет больше.
+3) *Социальные очки* — начисляются только победившей стороне согласно исходу матча.
+
+*MMR — простая формула дельты:*
+1) diff = разница средних MMR команд.
+2) x = floor(diff/10), если diff > 400 → x = 41.
+3) Если победила сильная: + (51−x) сильной и − (49−x) слабой.
+4) Если победила слабая: + (51+x) слабой и − (49+x) сильной.
+Потолки при большой разнице: +10/−8 (победа сильной) и +92/−90 (победа слабой).
+
+*Галлеоны (внутриигровая валюта)*
+1) Система начисления Галлеонов 🪙. Игроку зачисляется:
+- 1 монета за участие в любой игре (независимо от команды)
+- 1 монета за победу в игре 
+- Если игрок избран Воландемортом он получает ещё 3 монеты сверху (в итоге 5: 1 за участие + 1 за победу + 3 избрание)
+- Если игрок убивает Воландеморта — ещё 5 монет сверху (в итоге 1 за участие + 1 за победу + 5 за убийство)
+
+"Винстрик"
+- Если игрок побеждает 2 раза подряд — ему зачисляется на баланс 2 монеты (просто добавляется 2 монеты к его балансу)
+- Если игрок побеждает 3 раза подряд — ему зачисляется на баланс 4 монеты
+- Если игрок побеждает 4 раза подряд — ему зачисляется на баланс 8 монет
+- Если игрок побеждает 5 раз подряд — ему зачисляется на баланс 16 монет
+- Если игрок побеждает 6 раз подряд — ему зачисляется на баланс 32 монеты
+- Если игрок побеждает 7 раз подряд — ему зачисляется на баланс 100 монет
+Если игрок продолжает побеждать без поражений, ему зачисляется по 100 монет сверху за каждую победу (плюс стандартные +1 за участие и +1 за победу).
+
+"Лузстрик"
+- Если игрок проигрывает 2 раза подряд — ему зачисляется на баланс 2 монеты
+- Если игрок проигрывает 4 раза подряд — ему зачисляется на баланс 4 монеты
+- Если игрок проигрывает 6 раз подряд — ему зачисляется на баланс 6 монет
+Если игрок проигрывает 6 и более раз подряд, за каждое следующее поражение ему даётся по 6 монет сверху (+1 за участие), пока не будет хотя бы 1 победа; далее «стрик поражений» сбрасывается."""
+)
 @dp.message(CommandStart())
 async def start_cmd(m: Message, state: FSMContext):
     await state.clear()
@@ -582,7 +738,7 @@ async def faq(c: CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=home_kb_for_user(admin, is_authorized_user(c.from_user.id)),
     )
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data == "backhome")
 async def back_home(c: CallbackQuery, state: FSMContext):
@@ -596,7 +752,7 @@ async def back_home(c: CallbackQuery, state: FSMContext):
         "Главное меню.\nЭтот бот ведёт рейтинги игры «Тайный Воландеморт».",
         reply_markup=home_kb_for_user(admin, is_authorized_user(c.from_user.id)),
     )
-    await c.answer()
+    await safe_answer(c, )
 
 # ===================== Authorization =====================
 @dp.callback_query(F.data == "auth:start")
@@ -613,7 +769,7 @@ async def auth_start(c: CallbackQuery, state: FSMContext):
         "_Одним сообщением, до 25 символов._" + admin_note,
         parse_mode="Markdown",
     )
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.message(UserAuthFSM.wait_name)
 async def auth_take_name(m: Message, state: FSMContext):
@@ -655,7 +811,7 @@ async def auth_take_name(m: Message, state: FSMContext):
 @dp.callback_query(F.data == "start:newgame")
 async def start_newgame(c: CallbackQuery, state: FSMContext):
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     metric_click(c.from_user.id)
     async with Session() as session:
         ts = now_msk()
@@ -672,7 +828,7 @@ async def start_newgame(c: CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=main_menu_kb(g.id),
     )
-    await c.answer()
+    await safe_answer(c, )
 
 # ===================== Back to menu of a game =====================
 @dp.callback_query(F.data.startswith("back:"))
@@ -688,7 +844,7 @@ async def back_to_menu(c: CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=main_menu_kb(game_id),
     )
-    await c.answer()
+    await safe_answer(c, )
 
 # ===================== Pick teams / selection =====================
 async def effective_limit(session: Session, team: str, game_id: int) -> int:
@@ -701,7 +857,7 @@ async def multiteam_entry(c: CallbackQuery, state: FSMContext):
     game_id = int(game_id_s)
     if is_admin(c.from_user.id, c.from_user.username):
         await safe_edit(c.message, "Выберите источник списка игроков:", reply_markup=source_choice_kb(team, game_id))
-        await c.answer()
+        await safe_answer(c, )
         return
     await _open_multiteam_with_source(c, state, team, game_id, source="all")
 
@@ -719,7 +875,7 @@ async def _open_multiteam_with_source(c: CallbackQuery, state: FSMContext, team:
         if source == "day":
             ids = _load_day_list()
             if not ids:
-                await c.answer("«Список дня» пуст. Отметьте игроков в админ-панели.", show_alert=True)
+                await safe_answer(c, "«Список дня» пуст. Отметьте игроков в админ-панели.", show_alert=True)
                 source = "all"
         if source == "day":
             res = await session.execute(
@@ -751,7 +907,7 @@ async def _open_multiteam_with_source(c: CallbackQuery, state: FSMContext, team:
     )
     await state.update_data(source=source)
     await state.set_state(CreateGameFSM.selecting_team)
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("toggle:"))
 async def toggle_player(c: CallbackQuery, state: FSMContext):
@@ -770,11 +926,11 @@ async def toggle_player(c: CallbackQuery, state: FSMContext):
         red_ids = [p.id for p in red if not (vold and p.id == vold.id)]
         if team == "blue":
             if pid in red_ids or (vold_id and pid == vold_id):
-                await c.answer("Этот игрок уже в красных/он Воландеморт.", show_alert=True)
+                await safe_answer(c, "Этот игрок уже в красных/он Воландеморт.", show_alert=True)
                 return
         else:
             if pid in blue_ids or (vold_id and pid == vold_id):
-                await c.answer("Этот игрок уже в синих или является Воландемортом.", show_alert=True)
+                await safe_answer(c, "Этот игрок уже в синих или является Воландемортом.", show_alert=True)
                 return
 
     if pid in selected_ids:
@@ -783,7 +939,7 @@ async def toggle_player(c: CallbackQuery, state: FSMContext):
         async with Session() as session2:
             limit = await effective_limit(session2, team, game_id)
         if len(selected_ids) >= limit:
-            await c.answer(f"Достигнут лимит: {limit}.", show_alert=True)
+            await safe_answer(c, f"Достигнут лимит: {limit}.", show_alert=True)
             return
         selected_ids.append(pid)
 
@@ -819,7 +975,7 @@ async def toggle_player(c: CallbackQuery, state: FSMContext):
                 blue_ids=blue_ids, red_ids=red_ids
             )
         )
-        await c.answer()
+        await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("clear:"))
 async def clear_selection(c: CallbackQuery, state: FSMContext):
@@ -857,7 +1013,7 @@ async def clear_selection(c: CallbackQuery, state: FSMContext):
             blue_ids=blue_ids, red_ids=red_ids
         )
     )
-    await c.answer("Сброшено.")
+    await safe_answer(c, "Сброшено.")
 
 @dp.callback_query(F.data.startswith("save:"))
 async def save_selection(c: CallbackQuery, state: FSMContext):
@@ -869,7 +1025,7 @@ async def save_selection(c: CallbackQuery, state: FSMContext):
     async with Session() as session:
         await set_team_roster(session, game_id, team, selected_ids)
         summary, _, _, _ = await roster_summary(session, game_id)
-    await c.answer("Команда сохранена.")
+    await safe_answer(c, "Команда сохранена.")
     await safe_edit(
         c.message,
         f"Состав сохранён.\n\n{summary}",
@@ -885,7 +1041,7 @@ async def choose_voldemort_entry(c: CallbackQuery, state: FSMContext):
     game_id = int(game_id_s)
     if is_admin(c.from_user.id, c.from_user.username):
         await safe_edit(c.message, "Выберите источник списка игроков (Воландеморт):", reply_markup=source_choice_kb("voldemort", game_id))
-        await c.answer()
+        await safe_answer(c, )
         return
     await _open_vold_with_source(c, game_id, source="all")
 
@@ -894,7 +1050,7 @@ async def _open_vold_with_source(c: CallbackQuery, game_id: int, source: str):
         if source == "day":
             ids = _load_day_list()
             if not ids:
-                await c.answer("«Список дня» пуст. Отметьте игроков в админ-панели.", show_alert=True)
+                await safe_answer(c, "«Список дня» пуст. Отметьте игроков в админ-панели.", show_alert=True)
                 source = "all"
         if source == "day":
             res = await session.execute(
@@ -927,7 +1083,7 @@ async def pick_voldemort(c: CallbackQuery):
     async with Session() as session:
         blue, red, vold = await get_team_rosters(session, game_id)
         if pid in [p.id for p in blue]:
-            await c.answer("Этот игрок уже в синих — уберите его из синих сначала.", show_alert=True)
+            await safe_answer(c, "Этот игрок уже в синих — уберите его из синих сначала.", show_alert=True)
             return
         await set_voldemort(session, game_id, pid)
         summary, *_ = await roster_summary(session, game_id)
@@ -938,7 +1094,7 @@ async def pick_voldemort(c: CallbackQuery):
         parse_mode="Markdown",
         reply_markup=main_menu_kb(game_id),
     )
-    await c.answer("Воландеморт задан.")
+    await safe_answer(c, "Воландеморт задан.")
 
 # ===================== Search (без «создать игрока») =====================
 @dp.callback_query(F.data.startswith("search:"))
@@ -948,7 +1104,7 @@ async def ask_search(c: CallbackQuery, state: FSMContext):
     await state.update_data(search_target=team, game_id=int(game_id_s), _return_to="teamselect")
     await safe_edit(c.message, "Введите имя или имя+фамилию (например, *Иван Петров*):", parse_mode="Markdown")
     await state.set_state(CreateGameFSM.search_player_for)
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.message(CreateGameFSM.search_player_for)
 async def search_players_msg(m: Message, state: FSMContext):
@@ -1000,7 +1156,7 @@ async def check_roster(c: CallbackQuery, state: FSMContext):
     async with Session() as session:
         summary, *_ = await roster_summary(session, game_id)
     await safe_edit(c.message, summary, reply_markup=main_menu_kb(game_id))
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("winner:"))
 async def choose_winner(c: CallbackQuery, state: FSMContext):
@@ -1009,9 +1165,9 @@ async def choose_winner(c: CallbackQuery, state: FSMContext):
     game_id = int(game_id_s)
     async with Session() as session:
         blue, red, vold = await get_team_rosters(session, game_id)
-        ok, msg = validate_rosters(blue, red, vold)
+        ok, msg = await validate_rosters(blue, red, vold)
     if not ok:
-        await c.answer(msg, show_alert=True)
+        await safe_answer(c, msg, show_alert=True)
         return
     kb = InlineKeyboardBuilder()
     kb.button(text="🟦 Победа Ордена Феникса — 5 законов", callback_data=f"setres:blue_laws:{game_id}")
@@ -1021,7 +1177,7 @@ async def choose_winner(c: CallbackQuery, state: FSMContext):
     kb.button(text="⬅️ Назад", callback_data=f"back:{game_id}")
     kb.adjust(1)
     await safe_edit(c.message, "Выберите исход игры:", reply_markup=kb.as_markup())
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("setres:"))
 async def set_result(c: CallbackQuery, state: FSMContext):
@@ -1033,7 +1189,7 @@ async def set_result(c: CallbackQuery, state: FSMContext):
         async with Session() as session:
             blue, red, vold = await get_team_rosters(session, game_id)
             if not vold:
-                await c.answer("Сначала выберите Воландеморта.", show_alert=True)
+                await safe_answer(c, "Сначала выберите Воландеморта.", show_alert=True)
                 return
             res = await session.execute(
                 select(Player).where(Player.id.in_([p.id for p in blue])).order_by(Player.first_name.asc(), Player.last_name.asc())
@@ -1047,7 +1203,7 @@ async def set_result(c: CallbackQuery, state: FSMContext):
         await state.update_data(pending_result=result_type, game_id=game_id)
         await safe_edit(c.message, "Кто убил Воландеморта? Выберите игрока:", reply_markup=kb.as_markup())
         await state.set_state(CreateGameFSM.wait_pick_killer)
-        await c.answer()
+        await safe_answer(c, )
         return
 
     async with Session() as session:
@@ -1055,6 +1211,10 @@ async def set_result(c: CallbackQuery, state: FSMContext):
         await state.update_data(pending_gid=None)
         await state.update_data(pending_gid=None)
         summary = await apply_ratings(session, game_id)
+        summary = _normalize_summary_delta(summary)
+        summary = _normalize_summary_delta(summary)
+        summary = _strip_repeat_summary(summary)
+        summary = _strip_repeat_summary(summary)
         blue, red, _ = await get_team_rosters(session, game_id)
         b_avg = round(sum(p.rating for p in blue) / max(1, len(blue)), 1)
         r_avg = round(sum(p.rating for p in red) / max(1, len(red)), 1)
@@ -1066,12 +1226,12 @@ async def set_result(c: CallbackQuery, state: FSMContext):
         c.message,
         f"Игра завершена.\n"
         f"{hum}\n"
-        f"Средний MMR — Орден Феникса: {b_avg}, Красные: {r_avg}\n"
+        f"Средний MMR — Орден Феникса: {b_avg}, Пожиратели: {r_avg}\n"
         f"Фаворит матча: {fav}\n"
         f"{summary}",
         reply_markup=after_finish_kb(),
     )
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("killpick:"))
 async def picked_killer(c: CallbackQuery, state: FSMContext):
@@ -1082,6 +1242,8 @@ async def picked_killer(c: CallbackQuery, state: FSMContext):
     async with Session() as session:
         await set_result_type_and_killer(session, game_id, "blue_kill", killer_id=killer_id)
         summary = await apply_ratings(session, game_id)
+        summary = _normalize_summary_delta(summary)
+        summary = _normalize_summary_delta(summary)
         blue, red, _ = await get_team_rosters(session, game_id)
         b_avg = round(sum(p.rating for p in blue) / max(1, len(blue)), 1)
         r_avg = round(sum(p.rating for p in red) / max(1, len(red)), 1)
@@ -1093,12 +1255,12 @@ async def picked_killer(c: CallbackQuery, state: FSMContext):
         c.message,
         "Игра завершена.\n"
         f"{RESULT_HUMAN['blue_kill']}\n"
-        f"Средний MMR — Орден Феникса: {b_avg}, Красные: {r_avg}\n"
+        f"Средний MMR — Орден Феникса: {b_avg}, Пожиратели: {r_avg}\n"
         f"Фаворит матча: {fav}\n"
         f"{summary}",
         reply_markup=after_finish_kb(),
     )
-    await c.answer("Киллер сохранён.")
+    await safe_answer(c, "Киллер сохранён.")
 
 # ===================== Ratings / Export / Tops =====================
 @dp.callback_query(F.data == "rating:menu")
@@ -1114,7 +1276,7 @@ async def rating_menu(c: CallbackQuery, state: FSMContext):
     if not players:
         admin = is_admin(c.from_user.id, c.from_user.username)
         await safe_edit(c.message, "Пока нет игроков.", reply_markup=home_kb_for_user(admin, is_authorized_user(c.from_user.id)))
-        await c.answer()
+        await safe_answer(c, )
         return
     lines = [f"{i+1}. {full_name(p)} — {p.rating}" for i, p in enumerate(players)]
     await safe_edit(
@@ -1123,7 +1285,7 @@ async def rating_menu(c: CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=rating_kb(),
     )
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data == "rating:export")
 async def rating_export(c: CallbackQuery, state: FSMContext):
@@ -1161,7 +1323,7 @@ async def rating_export(c: CallbackQuery, state: FSMContext):
             )
         wb.save(file_path)
         await c.message.answer_document(FSInputFile(file_path), caption="Экспорт рейтинга (Excel)")
-        await c.answer("Файл готов.")
+        await safe_answer(c, "Файл готов.")
     finally:
         try: os.remove(file_path)
         except Exception: pass
@@ -1196,7 +1358,7 @@ async def rating_top(c: CallbackQuery):
         players = list(res.scalars().all())
 
     if not players:
-        await safe_edit(c.message, "Пока нет статистики.", reply_markup=rating_kb()); await c.answer(); return
+        await safe_edit(c.message, "Пока нет статистики.", reply_markup=rating_kb()); await safe_answer(c, ); return
 
     def points(p: Player) -> int:
         return (p.social_blue if role=="blue"
@@ -1206,7 +1368,7 @@ async def rating_top(c: CallbackQuery):
 
     lines = [f"{i+1}. {full_name(p)} — {points(p)} очк." for i, p in enumerate(players)]
     await safe_edit(c.message, f"{titles[role]}\n\n" + "\n".join(lines), reply_markup=rating_kb())
-    await c.answer()
+    await safe_answer(c, )
 
 # ===================== Finished games (admin & users) =====================
 
@@ -1290,14 +1452,14 @@ async def leave_stay(c: CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=main_menu_kb(gid),
     )
-    await c.answer()
+    await safe_answer(c, )
 @dp.callback_query(F.data == "finished:menu")
 async def finished_menu(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
     if await _maybe_warn_unfinished(c, state, "finished:menu"):
         return
     await safe_edit(c.message, "Завершённые игры — выберите период:", reply_markup=finished_menu_kb())
-    await c.answer()
+    await safe_answer(c, )
 
 def _games_in_range(all_games: List[Game], start: Optional[datetime]) -> List[Game]:
     if start is None:
@@ -1324,9 +1486,9 @@ async def finished_week(c: CallbackQuery):
     week_ago = now_msk() - timedelta(days=7)
     items = _games_in_range(games, week_ago)
     if not items:
-        await safe_edit(c.message, "За последнюю неделю игр нет.", reply_markup=finished_menu_kb()); await c.answer(); return
+        await safe_edit(c.message, "За последнюю неделю игр нет.", reply_markup=finished_menu_kb()); await safe_answer(c, ); return
     await safe_edit(c.message, "Выберите игру:", reply_markup=games_pick_kb(items, allow_notes=is_admin(c.from_user.id, c.from_user.username)))
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data == "finished:all")
 async def finished_all(c: CallbackQuery):
@@ -1334,16 +1496,16 @@ async def finished_all(c: CallbackQuery):
     async with Session() as session:
         games = await list_all_games(session)
     if not games:
-        await safe_edit(c.message, "Игр ещё нет.", reply_markup=finished_menu_kb()); await c.answer(); return
+        await safe_edit(c.message, "Игр ещё нет.", reply_markup=finished_menu_kb()); await safe_answer(c, ); return
     await safe_edit(c.message, "Выберите игру:", reply_markup=games_pick_kb(games, allow_notes=is_admin(c.from_user.id, c.from_user.username)))
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("finished:view:"))
 async def finished_view(c: CallbackQuery):
     metric_click(c.from_user.id)
     gid = int(c.data.split(":")[2])
     await safe_edit(c.message, f"Игра ID {gid}: выберите действие.", reply_markup=finished_actions_kb(gid, admin=is_admin(c.from_user.id, c.from_user.username)))
-    await c.answer()
+    await safe_answer(c, )
 
 
 @dp.callback_query(F.data.startswith("finished:result:"))
@@ -1372,18 +1534,18 @@ async def finished_result(c: CallbackQuery):
         f"{notes_text}"
     )
     await safe_edit(c.message, txt, reply_markup=finished_actions_kb(gid, admin=is_admin(c.from_user.id, c.from_user.username)))
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("finished:note:"))
 async def finished_note(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     gid = int(c.data.split(":")[2])
     await state.update_data(note_gid=gid)
     await state.set_state(CreateGameFSM.wait_note_text)
     await safe_edit(c.message, "Введите текст заметки одним сообщением:", reply_markup=finished_actions_kb(gid, admin=True))
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.message(CreateGameFSM.wait_note_text)
 async def finished_note_text(m: Message, state: FSMContext):
@@ -1401,13 +1563,13 @@ async def finished_note_text(m: Message, state: FSMContext):
 async def admin_apps(c: CallbackQuery):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     apps = [a for a in _load_apps() if a.get("status") == "pending"]
     kb = InlineKeyboardBuilder()
     if not apps:
         kb.button(text="⬅️ Назад", callback_data="admin:menu")
         kb.adjust(1)
-        await safe_edit(c.message, "Заявок пока нет.", reply_markup=kb.as_markup()); await c.answer(); return
+        await safe_edit(c.message, "Заявок пока нет.", reply_markup=kb.as_markup()); await safe_answer(c, ); return
     for a in apps:
         text = f"{a['name']} (user_id {a['user_id']})"
         kb.button(text=f"✅ Принять: {text}", callback_data=f"app:approve:{a['user_id']}")
@@ -1415,18 +1577,18 @@ async def admin_apps(c: CallbackQuery):
     kb.button(text="⬅️ Назад", callback_data="admin:menu")
     kb.adjust(1)
     await safe_edit(c.message, "Заявки в Бота:", reply_markup=kb.as_markup())
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("app:approve:"))
 async def app_approve(c: CallbackQuery):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     uid = int(c.data.split(":")[2])
     apps = _load_apps()
     app = next((a for a in apps if a["user_id"] == uid and a["status"] == "pending"), None)
     if not app:
-        await c.answer("Заявка не найдена.", show_alert=True); return
+        await safe_answer(c, "Заявка не найдена.", show_alert=True); return
     parts = app["name"].split()
     first, last = parts[0], (" ".join(parts[1:]) if len(parts) > 1 else None)
     async with Session() as session:
@@ -1439,26 +1601,26 @@ async def app_approve(c: CallbackQuery):
     app["status"] = "approved"
     _save_apps(apps)
     metric_inc("auth_approved")
-    await c.answer("Заявка принята.")
+    await safe_answer(c, "Заявка принята.")
     await admin_menu(c, None)
 
 @dp.callback_query(F.data.startswith("app:reject:"))
 async def app_reject(c: CallbackQuery):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     uid = int(c.data.split(":")[2])
     apps = _load_apps()
     app = next((a for a in apps if a["user_id"] == uid and a["status"] == "pending"), None)
     if not app:
-        await c.answer("Заявка не найдена.", show_alert=True); return
+        await safe_answer(c, "Заявка не найдена.", show_alert=True); return
     try:
         await bot.send_message(app["chat_id"], "Упс! Что-то пошло не так, проверьте правильность введённых данных и попробуйте авторизоваться ещё раз!")
     except Exception:
         pass
     app["status"] = "rejected"
     _save_apps(apps)
-    await c.answer("Заявка отклонена.")
+    await safe_answer(c, "Заявка отклонена.")
     await admin_menu(c, None)
 
 # ===================== Admin utils =====================
@@ -1468,22 +1630,22 @@ async def admin_menu(c: CallbackQuery, state: FSMContext):
     if await _maybe_warn_unfinished(c, state, "admin:menu"):
         return
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True)
+        await safe_answer(c, "Только для админов.", show_alert=True)
         return
     await safe_edit(c.message, "🛠 Админ-панель", reply_markup=admin_menu_kb())
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data == "admin:players")
 async def admin_players(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True)
+        await safe_answer(c, "Только для админов.", show_alert=True)
         return
     async with Session() as session:
         res = await session.execute(select(Player).order_by(Player.first_name.asc(), Player.last_name.asc()))
         players = list(res.scalars().all())
     if not players:
-        await safe_edit(c.message, "Пока нет игроков.", reply_markup=admin_menu_kb()); await c.answer(); return
+        await safe_edit(c.message, "Пока нет игроков.", reply_markup=admin_menu_kb()); await safe_answer(c, ); return
     kb = InlineKeyboardBuilder()
     for p in players:
         label = f"{full_name(p)} (ID {p.id}, {p.rating})"
@@ -1492,13 +1654,13 @@ async def admin_players(c: CallbackQuery, state: FSMContext):
     kb.button(text="⬅️ Назад", callback_data="admin:menu")
     kb.adjust(1)
     await safe_edit(c.message, "Игроки (редактирование / удаление):", reply_markup=kb.as_markup())
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("admin:player:edit:"))
 async def admin_player_edit(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     _, _, _, pid_s = c.data.split(":")
     pid = int(pid_s)
     await state.update_data(edit_player_id=pid)
@@ -1512,7 +1674,7 @@ async def admin_player_edit(c: CallbackQuery, state: FSMContext):
         reply_markup=kb.as_markup(),
     )
     await state.set_state(AdminFSM.wait_new_fullname)
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.message(AdminFSM.wait_new_fullname)
 async def admin_player_apply_name(m: Message, state: FSMContext):
@@ -1550,7 +1712,7 @@ async def admin_player_apply_name(m: Message, state: FSMContext):
 async def admin_player_delete(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     _, _, _, pid_s = c.data.split(":")
     pid = int(pid_s)
     async with Session() as session:
@@ -1564,32 +1726,32 @@ async def admin_player_delete(c: CallbackQuery, state: FSMContext):
         kb.button(text=f"🗑 {label}", callback_data=f"admin:player:del:{p.id}")
     kb.button(text="⬅️ Назад", callback_data="admin:menu")
     kb.adjust(1)
-    await c.answer(msg if msg else ("Игрок удалён." if removed else "Операция завершена."))
+    await safe_answer(c, msg if msg else ("Игрок удалён." if removed else "Операция завершена."))
     await safe_edit(c.message, "Игроки (редактирование / удаление):", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data == "admin:games")
 async def admin_games(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     async with Session() as session:
         games = await list_all_games(session)
     if not games:
-        await safe_edit(c.message, "Игр ещё нет.", reply_markup=admin_menu_kb()); await c.answer(); return
+        await safe_edit(c.message, "Игр ещё нет.", reply_markup=admin_menu_kb()); await safe_answer(c, ); return
     await safe_edit(c.message, "Игры (удаление — последние 50):", reply_markup=admin_games_kb(games))
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.startswith("admin:game:del:"))
 async def admin_game_delete(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     _, _, _, gid_s = c.data.split(":")
     gid = int(gid_s)
     async with Session() as session:
         await delete_game(session, gid)
         games = await list_all_games(session)
-    await c.answer(f"Игра {gid} удалена (каскадно удалены её участники).")
+    await safe_answer(c, f"Игра {gid} удалена (каскадно удалены её участники).")
     if games:
         await safe_edit(c.message, "Игры (удаление — последние 50):", reply_markup=admin_games_kb(games))
     else:
@@ -1599,18 +1761,18 @@ async def admin_game_delete(c: CallbackQuery, state: FSMContext):
 async def admin_recompute(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     async with Session() as session:
         summary = await recompute_all_ratings(session)
     await safe_edit(c.message, f"✅ Пересчёт завершён.\n{summary}", reply_markup=admin_menu_kb())
-    await c.answer("Рейтинг пересчитан.")
+    await safe_answer(c, "Рейтинг пересчитан.")
 
 
 @dp.callback_query(F.data == "admin:info")
 async def admin_info(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     txt = """<b>ℹ️ Инфо для админов</b>
 
 <u>Главное меню</u>
@@ -1620,7 +1782,6 @@ async def admin_info(c: CallbackQuery, state: FSMContext):
 • <b>🏆 Рейтинг игроков</b> — общий рейтинг (MMR), экспорт в Excel, разрезы.
 • <b>📊 Моя статистика</b> — личные позиции в рейтингах.
 • <b>❓ FAQ</b> — правила расчётов и терминология.
-• <b>🔐 Авторизация</b> — привязка Telegram-пользователя к карточке игрока.
 • <b>🛠 Админ-панель</b> — раздел управления данными и метриками.
 • <b>⬅️ В главное меню</b> — вернуться на стартовый экран.
 
@@ -1636,36 +1797,35 @@ async def admin_info(c: CallbackQuery, state: FSMContext):
 • <b>🎮 Игры (удаление)</b> — каскадное удаление игры и её участников.
 • <b>🔁 Пересчитать рейтинг (все)</b> — сбросить MMR/соц‑очки и пересчитать все игры.
 • <b>📋 Список дня</b> — быстрый список игроков для набора команд.
-• <b>📫 Заявки в Бота</b> — заявки пользователей: принять/отклонить.
 • <b>📈 Статистика бота</b> — счётчики, активные пользователи, экспорт в Excel.
 • <b>⬅️ В главное меню</b> — вернуться на стартовый экран.
 """
     await safe_edit(c.message, txt, parse_mode="HTML", reply_markup=admin_menu_kb())
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data == "botstats:menu")
 async def botstats_menu(c: CallbackQuery):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     await safe_edit(c.message, "Статистика бота — выберите период:", reply_markup=botstats_menu_kb())
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data.in_(("botstats:week","botstats:month","botstats:all")))
 async def botstats_show(c: CallbackQuery):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     mode = c.data.split(":")[1]
     text, _ = _metrics_summary(mode)
     await safe_edit(c.message, text, parse_mode="HTML", reply_markup=botstats_menu_kb())
-    await c.answer()
+    await safe_answer(c, )
 
 @dp.callback_query(F.data == "botstats:export")
 async def botstats_export(c: CallbackQuery):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
-        await c.answer("Только для админов.", show_alert=True); return
+        await safe_answer(c, "Только для админов.", show_alert=True); return
     from openpyxl import Workbook
     m = _load_json_obj(METRICS_PATH)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
@@ -1683,7 +1843,7 @@ async def botstats_export(c: CallbackQuery):
             ws2.append([k, v])
         wb.save(file_path)
         await c.message.answer_document(FSInputFile(file_path), caption="Статистика бота (Excel)")
-        await c.answer("Файл готов.")
+        await safe_answer(c, "Файл готов.")
     finally:
         try: os.remove(file_path)
         except Exception: pass
@@ -1726,7 +1886,7 @@ async def player_of_the_day(c: CallbackQuery, state: FSMContext):
     if not agg:
         admin = is_admin(c.from_user.id, c.from_user.username)
         await safe_edit(c.message, "За сегодня игр ещё не было.", reply_markup=home_kb_for_user(admin, is_authorized_user(c.from_user.id)))
-        await c.answer(); return
+        await safe_answer(c, ); return
 
     def key(pid):
         a = agg[pid]
@@ -1755,7 +1915,7 @@ async def player_of_the_day(c: CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=home_kb_for_user(admin, is_authorized_user(c.from_user.id))
     )
-    await c.answer()
+    await safe_answer(c, )
 
 # ===================== My stats =====================
 @dp.callback_query(F.data == "me:stats")
@@ -1765,11 +1925,11 @@ async def my_stats(c: CallbackQuery, state: FSMContext):
         return
     pid = get_player_id_for_user(c.from_user.id)
     if not pid:
-        await c.answer("Вы не авторизованы.", show_alert=True); return
+        await safe_answer(c, "Вы не авторизованы.", show_alert=True); return
     async with Session() as session:
         me = await session.get(Player, pid)
         if not me:
-            await c.answer("Игрок не найден. Обратитесь к администратору.", show_alert=True); return
+            await safe_answer(c, "Игрок не найден. Обратитесь к администратору.", show_alert=True); return
         res_all = await session.execute(select(Player).order_by(Player.rating.desc(), Player.first_name.asc()))
         players = list(res_all.scalars().all())
         def rank_by(key):
@@ -1799,7 +1959,187 @@ async def my_stats(c: CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=home_kb_for_user(admin, True),
     )
-    await c.answer()
+    await safe_answer(c, )
+
+
+
+# --- Win/Lose Streaks ---
+@dp.callback_query(F.data == "me:streak")
+async def me_streak(c: CallbackQuery, state: FSMContext):
+    metric_click(c.from_user.id)
+    pid = get_player_id_for_user(c.from_user.id)
+    if not pid:
+        await safe_answer(c, "Вы не авторизованы.", show_alert=True); return
+
+    async with Session() as session:
+        s = await get_player_streaks(session, pid)
+
+    text = (
+        "📈 <b>Ваши стрики</b>\n\n"
+        f"• Ваш winstreak: <b>{s['max_win']}</b>\n"
+        f"• Ваш losestreak: <b>{s['max_lose']}</b>\n"
+        f"• Ваш активный winstreak: <b>{s['cur_win']}</b>\n"
+        f"• Ваш активный losestreak: <b>{s['cur_lose']}</b>"
+    )
+    await safe_edit(
+        c.message,
+        text,
+        parse_mode="HTML",
+        reply_markup=home_kb_for_user(is_admin(c.from_user.id, c.from_user.username), True),
+    )
+    await safe_answer(c, )
+
+# ===================== Galleons / Shop Handlers =====================
+@dp.callback_query(F.data == "me:galleons")
+async def me_galleons(c: CallbackQuery, state: FSMContext):
+    metric_click(c.from_user.id)
+    # Не зависаем даже без привязки
+    pid = get_player_id_for_user(c.from_user.id)
+    galls = 0
+    if pid:
+        async with Session() as session:
+            p = await session.get(Player, pid)
+            if p and getattr(p, "galleons_balance", None) is not None:
+                galls = int(p.galleons_balance)
+    text = f"Количество Галлеонов {COIN} {galls}"
+    await safe_edit(c.message, text, reply_markup=home_kb_for_user(is_admin(c.from_user.id, c.from_user.username), True))
+    await safe_answer(c, )
+
+@dp.callback_query(F.data == "shop:menu")
+async def shop_menu(c: CallbackQuery, state: FSMContext):
+    metric_click(c.from_user.id)
+    if not is_authorized_user(c.from_user.id):
+        await safe_answer(c, "Вы не авторизованы.", show_alert=True); return
+    await safe_edit(c.message, "Лавка Олливандера. Выберите товар:", reply_markup=shop_menu_kb())
+    await safe_answer(c, )
+
+@dp.callback_query(F.data.startswith("shop:buy:"))
+async def shop_buy(c: CallbackQuery, state: FSMContext):
+    metric_click(c.from_user.id)
+    if not is_authorized_user(c.from_user.id):
+        await safe_answer(c, "Вы не авторизованы.", show_alert=True); return
+    code = c.data.split(":", 2)[2]
+    item = next((i for i in SHOP_ITEMS if i["code"] == code), None)
+    if not item:
+        await safe_answer(c, "Товар не найден.", show_alert=True); return
+    pid = get_player_id_for_user(c.from_user.id)
+    async with Session() as session:
+        p = await session.get(Player, pid)
+        balance = p.galleons_balance
+    if balance < item["cost"]:
+        await safe_answer(c, f"Недостаточно Галлеонов 🪙 🪙 для покупки «{item['title']}».", show_alert=True); return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Да", callback_data=f"shop:confirm:{code}")
+    kb.button(text="Нет", callback_data="shop:cancel")
+    kb.adjust(2)
+    await safe_edit(c.message, f"Вы точно хотите приобрести «{item['title']}» за {item['cost']}{COIN}?", reply_markup=kb.as_markup())
+    await safe_answer(c, )
+
+@dp.callback_query(F.data == "shop:cancel")
+async def shop_cancel(c: CallbackQuery, state: FSMContext):
+    metric_click(c.from_user.id)
+    await shop_menu(c, state)
+
+@dp.callback_query(F.data.startswith("shop:confirm:"))
+async def shop_confirm(c: CallbackQuery, state: FSMContext):
+    metric_click(c.from_user.id)
+    if not is_authorized_user(c.from_user.id):
+        await safe_answer(c, "Вы не авторизованы.", show_alert=True); return
+    code = c.data.split(":", 2)[2]
+    item = next((i for i in SHOP_ITEMS if i["code"] == code), None)
+    if not item:
+        await safe_answer(c, "Товар не найден.", show_alert=True); return
+    pid = get_player_id_for_user(c.from_user.id)
+    async with Session() as session:
+        p = await session.get(Player, pid)
+        if p.galleons_balance < item["cost"]:
+            await safe_answer(c, "Недостаточно Галлеонов 🪙 🪙.", show_alert=True); return
+        # Create purchase and deduct balance
+        title = item["title"]
+        pur = await create_purchase(session, pid, code, title, item["cost"])
+        p.galleons_balance -= item["cost"]
+        await session.commit()
+    receipt_text = None
+    if code == "pm_first_game":
+        receipt_text = "Вы приобрели сертификат на заявление себя первым министром в первой игре вечера (до раздачи ролей)."
+    elif code == "pm_replace_lord":
+        receipt_text = "Вы приобрели сертификат на заявление себя министром сместив прошлого лорда."
+    elif code == "badge":
+        receipt_text = "Фирменный значок. Покажите данное сообщение сотруднику Антикафе."
+    elif code == "random_12_rooms":
+        receipt_text = "Вы приобрели случайный сертификат 12 комнат. Покажите данное сообщение сотруднику Антикафе."
+    elif code == "named_ballot":
+        receipt_text = "Вы приобрели именную голосовалку. Покажите данное сообщение сотруднику Антикафе."
+    else:
+        receipt_text = f"Вы приобрели: {item['title']}"
+    receipt = (
+        f"{item['emoji']} {receipt_text}\n"
+        f"Время покупки: { _msk_now_str() }\n"
+        f"С вас списано: {item['cost']} Галлеонов 🪙 🪙."
+    )
+    await safe_edit(c.message, receipt, parse_mode="HTML", reply_markup=home_kb_for_user(is_admin(c.from_user.id, c.from_user.username), True))
+
+    await safe_answer(c, "Покупка оформлена.")
+
+
+@dp.callback_query(F.data == "mypur:menu")
+async def mypur_menu(c: CallbackQuery, state: FSMContext):
+    metric_click(c.from_user.id)
+    if not is_authorized_user(c.from_user.id):
+        await safe_answer(c, "Вы не авторизованы.", show_alert=True); return
+    pid = get_player_id_for_user(c.from_user.id)
+    async with Session() as session:
+        purchases = await list_purchases(session, pid)
+    if not purchases:
+        await safe_edit(c.message, "Пока пусто. Здесь будут ваши покупки.", reply_markup=home_kb_for_user(is_admin(c.from_user.id, c.from_user.username), True))
+        await safe_answer(c, ); return
+    await safe_edit(c.message, "Мои покупки:", reply_markup=mypurchases_list_kb(purchases))
+    await safe_answer(c, )
+
+@dp.callback_query(F.data.startswith("mypur:item:"))
+async def mypur_item(c: CallbackQuery, state: FSMContext):
+    metric_click(c.from_user.id)
+    pid = get_player_id_for_user(c.from_user.id)
+    if not pid:
+        await safe_answer(c, "Вы не авторизованы.", show_alert=True); return
+    pur_id = int(c.data.split(":")[2])
+    async with Session() as session:
+        from db import Purchase
+        pur = await session.get(Purchase, pur_id)
+    if not pur or pur.player_id != pid:
+        await safe_answer(c, "Покупка не найдена.", show_alert=True); return
+    text = f"Покупка: {pur.title}\nСтатус: {'✅ Получено' if pur.is_received else '❌ Не получено'}"
+    await safe_edit(c.message, text, reply_markup=purchase_status_kb(pur_id))
+    await safe_answer(c, )
+
+@dp.callback_query(F.data.startswith("mypur:set:"))
+async def mypur_set(c: CallbackQuery, state: FSMContext):
+    metric_click(c.from_user.id)
+    pid = get_player_id_for_user(c.from_user.id)
+    if not pid:
+        await safe_answer(c, "Вы не авторизованы.", show_alert=True); return
+    _, _, pur_id, received = c.data.split(":")
+    pur_id = int(pur_id); received = received == "1"
+    async with Session() as session:
+        from db import Purchase
+        pur = await session.get(Purchase, pur_id)
+        if not pur or pur.player_id != pid:
+            await safe_answer(c, "Покупка не найдена.", show_alert=True); return
+        ok = await set_purchase_received(session, pur_id, received)
+    await mypur_menu(c, state)
+    await safe_answer(c, "Статус обновлён.")
+
+# Admin: recompute galleons
+@dp.callback_query(F.data == "admin:recompute_galleons")
+async def admin_recompute_galleons(c: CallbackQuery, state: FSMContext):
+    metric_click(c.from_user.id)
+    if not is_admin(c.from_user.id, c.from_user.username):
+        await safe_answer(c, "Только для админов.", show_alert=True); return
+    async with Session() as session:
+        summary = await recompute_all_galleons(session)
+    await safe_edit(c.message, f"✅ Пересчёт Галлеонов завершён.\n{summary}", reply_markup=admin_menu_kb())
+    await safe_answer(c, "Галлеоны пересчитаны.")
+
 
 # ===================== Fallback =====================
 @dp.message()

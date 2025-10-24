@@ -1,222 +1,218 @@
+
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
-import json
 from pathlib import Path
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, select
+import json
+
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import INITIAL_RATING, MAX_BLUE
-from db import Game, GameParticipant, Player
+from db import Player, Game, GameParticipant, now_msk
 
-# ====== пути лёгких логов (для "Игрок дня" и аналитики) ======
-STATS_LOG_PATH = Path("game_stats.json")  # поигровая статистика на уровне игроков
+# ---- Time helpers (safe MSK) ----
+try:
+    from zoneinfo import ZoneInfo
+    MSK = ZoneInfo("Europe/Moscow")
+except Exception:
+    MSK = timezone(timedelta(hours=3))
 
-RU_MONTHS = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
-
-# ============== Small FS helpers ==============
 def _now_msk() -> datetime:
-    return datetime.now(ZoneInfo("Europe/Moscow"))
+    try:
+        from zoneinfo import ZoneInfo as _Z
+        return datetime.now(_Z("Europe/Moscow"))
+    except Exception:
+        return datetime.now(timezone(timedelta(hours=3)))
+
+# ===== JSON log path for per-player stats ("Игрок дня") =====
+STATS_LOG_PATH = Path("game_stats.json")
 
 def _load_json(path: Path):
-    if not path.exists():
-        return []
     try:
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return []
 
-def _save_json(path: Path, data):
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+def _save_json(path: Path, payload):
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-# ============== Team helpers ==============
+# ================= Team helpers =================
+@dataclass
+class TeamAverages:
+    blue_avg: float
+    red_avg: float
+
 async def get_team_rosters(session: AsyncSession, game_id: int) -> Tuple[List[Player], List[Player], Optional[Player]]:
-    res = await session.execute(select(Game).where(Game.id == game_id))
-    g: Game = res.scalar_one()
-    res2 = await session.execute(select(GameParticipant).where(GameParticipant.game_id == game_id))
-    parts = list(res2.scalars().all())
+    """Return (blue_players, red_players, voldemort_player). Red list includes Voldemort."""
+    g = await session.get(Game, game_id)
+    if not g:
+        return [], [], None
+    res = await session.execute(select(GameParticipant).where(GameParticipant.game_id == game_id))
+    parts = list(res.scalars().all())
     blue_ids = [p.player_id for p in parts if p.team == "blue"]
     red_ids = [p.player_id for p in parts if p.team in ("red", "voldemort")]
     blue: List[Player] = []
     red: List[Player] = []
+    vold: Optional[Player] = None
     if blue_ids:
         resb = await session.execute(select(Player).where(Player.id.in_(blue_ids)))
         blue = list(resb.scalars().all())
     if red_ids:
         resr = await session.execute(select(Player).where(Player.id.in_(red_ids)))
         red = list(resr.scalars().all())
-    vold = await session.get(Player, g.voldemort_id) if g.voldemort_id else None
+    if g.voldemort_id:
+        vold = await session.get(Player, g.voldemort_id)
     return blue, red, vold
 
-def validate_rosters(blue: List[Player], red: List[Player], vold: Optional[Player]) -> Tuple[bool, str]:
-    if not blue:
-        return False, "Не выбрана синяя команда."
-    if not red:
-        return False, "Не выбрана красная сторона (красные и/или Воландеморт)."
-    if not vold:
-        return False, "Не выбран Воландеморт."
-    if any(p.id == vold.id for p in blue):
-        return False, "Воландеморт не может быть в синих."
-    if len(blue) > MAX_BLUE:
-        return False, f"Синих игроков не может быть больше {MAX_BLUE}."
-    red_wo_vold = [p for p in red if p.id != (vold.id if vold else -1)]
-    if len(red_wo_vold) > 3:
-        return False, "Красных игроков не может быть больше 3 (Воландеморт отдельно)."
-    return True, "Состав корректен."
-
-# ============== Search proxy ==============
-async def search_players(session: AsyncSession, query: str) -> List[Player]:
-    from db import search_players as _search
-    return await _search(session, query)
-
-# ============== Team mutators ==============
-async def set_team_roster(session: AsyncSession, game_id: int, team: str, player_ids: List[int]) -> None:
-    """Перезаписывает состав указанной стороны (blue/red). Воландеморта не трогаем здесь."""
-    if team not in ("blue", "red"):
-        return
-    g = await session.get(Game, game_id)
-    vold_id = g.voldemort_id
-
-    await session.execute(
-        delete(GameParticipant).where(
-            GameParticipant.game_id == game_id,
-            GameParticipant.team == team,
-        )
-    )
-    for pid in player_ids:
-        if team == "red" and vold_id and pid == vold_id:
-            continue
-        session.add(GameParticipant(game_id=game_id, player_id=pid, team=team))
-    await session.commit()
-
-# ============== Result setters ==============
-async def set_voldemort(session: AsyncSession, game_id: int, player_id: int):
-    g = await session.get(Game, game_id)
-    g.voldemort_id = player_id
-    existing = await session.execute(
-        select(GameParticipant).where(GameParticipant.game_id == game_id, GameParticipant.player_id == player_id)
-    )
-    if not existing.scalars().first():
-        session.add(GameParticipant(game_id=game_id, player_id=player_id, team="voldemort"))
-    else:
-        await session.execute(
-            delete(GameParticipant).where(
-                GameParticipant.game_id == game_id,
-                GameParticipant.player_id == player_id,
-                GameParticipant.team.in_(("blue", "red")),
-            )
-        )
-        session.add(GameParticipant(game_id=game_id, player_id=player_id, team="voldemort"))
-    await session.commit()
-
-async def set_result_type_and_killer(session: AsyncSession, game_id: int, result_type: str, killer_id: Optional[int]):
-    g = await session.get(Game, game_id)
-    g.result_type = result_type
-    if result_type == "blue_kill":
-        g.killer_id = killer_id
-        g.winner = "blue"
-    elif result_type == "blue_laws":
-        g.killer_id = None
-        g.winner = "blue"
-    elif result_type in ("red_laws", "red_director"):
-        g.killer_id = None
-        g.winner = "red"
-    await session.commit()
-
-# ============== Ratings logic ==============
-@dataclass
-class TeamAverages:
-    blue_avg: float
-    red_avg: float
-
-async def _team_avgs(session: AsyncSession, blue: List[Player], red: List[Player]) -> TeamAverages:
+def _team_avgs(blue: List[Player], red: List[Player]) -> TeamAverages:
     b = sum(p.rating for p in blue) / max(len(blue), 1)
     r = sum(p.rating for p in red) / max(len(red), 1)
-    return TeamAverages(blue_avg=b, red_avg=r)
+    return TeamAverages(b, r)
 
-def _mmr_delta(blue_avg: float, red_avg: float, winner: str) -> Tuple[int, int]:
+# ================= Core MMR =================
+from typing import Tuple as _Tuple
+
+
+def _mmr_delta(blue_avg: float, red_avg: float, winner: str) -> _Tuple[int, int]:
     """
-    Новые правила:
-      diff ≤ 250: обе стороны ±25
-      251–500:     сильная +23 / −28, слабая +28 / −23
-      501–1000:    сильная +20 / −30, слабая +30 / −20
-      ≥1001:       сильная +15 / −35, слабая +35 / −15
-    Возвращаем (delta_blue, delta_red) с точки зрения команды-победителя `winner`.
+    НЕмасштабированная (raw) формула дельты MMR:
+      diff = |AVG_blue − AVG_red|
+      x = floor(diff/10); если diff > 400 → x_eff = 41 (то есть как при 410+).
+      Если побеждает более сильная команда: сильная +(51−x_eff), слабая −(49−x_eff).
+      Если побеждает более слабая команда: слабая +(51+x_eff), сильная −(49+x_eff).
+    НИКАКОГО дополнительного масштабирования по сумме 100 здесь нет.
     """
     diff = abs(blue_avg - red_avg)
+    x = int(diff // 10)
+    x_eff = 41 if x > 40 else x
 
-    def pack(strong_win, strong_lose, weak_win, weak_lose, blue_is_strong) -> Tuple[int, int]:
-        if winner == "blue":
-            return (strong_win if blue_is_strong else weak_win,
-                    strong_lose if not blue_is_strong else weak_lose)
+    blue_is_strong = blue_avg >= red_avg
+
+    if winner == "blue":
+        if blue_is_strong:
+            delta_blue = 51 - x_eff     # например diff=400 => +11
+            delta_red  = -(49 - x_eff)  # и -9
         else:
-            return (strong_lose if blue_is_strong else weak_lose,
-                    strong_win if not blue_is_strong else weak_win)
+            delta_blue = 51 + x_eff     # например diff=400 => +91
+            delta_red  = -(49 + x_eff)  # и -89
+    else:  # winner == "red"
+        if not blue_is_strong:          # красные сильнее
+            delta_red  = 51 - x_eff
+            delta_blue = -(49 - x_eff)
+        else:                            # красные слабее
+            delta_red  = 51 + x_eff
+            delta_blue = -(49 + x_eff)
 
-    # определяем кто сильнее по среднему
-    blue_is_strong = blue_avg > red_avg
+    return int(delta_blue), int(delta_red)
+    lam = 100.0 / s
+    db = delta_blue * lam
+    dr = delta_red * lam
+    ib = int(round(db))
+    ir = int(round(dr))
+    # Коррекция до точной "100"
+    total = abs(ib) + abs(ir)
+    if total < 100:
+        # добавим 1 очко стороне с большим модулем (чаще победителю)
+        if abs(ib) >= abs(ir):
+            ib += 1 if ib > 0 else -1 if ib < 0 else 1
+        else:
+            ir += 1 if ir > 0 else -1 if ir < 0 else -1
+    elif total > 100:
+        if abs(ib) >= abs(ir):
+            ib -= 1 if ib > 0 else -1 if ib < 0 else 1
+        else:
+            ir -= 1 if ir > 0 else -1 if ir < 0 else -1
+    return int(ib), int(ir)
 
-    if diff <= 250:
-        # симметричный случай
-        return (25, -25) if winner == "blue" else (-25, 25)
-    elif diff <= 500:
-        return pack(23, -28, 28, -23, blue_is_strong)
-    elif diff <= 1000:
-        return pack(20, -30, 30, -20, blue_is_strong)
-    else:
-        return pack(15, -35, 35, -15, blue_is_strong)
-
-def _add_social(result_type: str, blue: List[Player], red: List[Player], vold: Optional[Player], killer: Optional[Player]) -> Dict[int, Dict[str, int]]:
-    """Возвращает dict{id: {field: +inc}} для единоразового применения."""
-    inc: dict[int, dict[str, int]] = {}
+# ================= Social points =================
+def _add_social(result_type: str, blue: List[Player], red: List[Player], killer: Optional[Player]) -> Dict[int, Dict[str, int]]:
+    """Единичные «социальные» очки за конкретный исход (на основе прежней логики)."""
+    inc: Dict[int, Dict[str, int]] = {}
 
     def add(p: Player, field: str, v: int = 1):
-        inc.setdefault(p.id, {})
-        inc[p.id][field] = inc[p.id].get(field, 0) + v
+        d = inc.setdefault(p.id, {})
+        d[field] = d.get(field, 0) + v
 
-    if result_type == "blue_laws":
+    if result_type.startswith("blue_"):
         for p in blue:
             add(p, "social_blue", 1)
-            add(p, "blue_wins", 1)
-    elif result_type == "blue_kill":
-        for p in blue:
-            add(p, "social_blue", 1)
-            add(p, "blue_wins", 1)
         if killer:
-            add(killer, "social_blue", 1)   # бонус за убийство
             add(killer, "killer_points", 1)
-    elif result_type == "red_laws":
+    else:
         for p in red:
             add(p, "social_red", 1)
-            add(p, "red_wins", 1)
-    elif result_type == "red_director":
-        for p in red:
-            add(p, "social_red", 1)
-            add(p, "red_wins", 1)
-        if vold:
-            add(vold, "social_vold", 1)
-            add(vold, "vold_wins", 1)
-
+        if killer:
+            add(killer, "killer_points", 1)
     return inc
 
-def _append_game_stats(game_id: int,
-                       blue: List[Player], red: List[Player],
-                       avgs: TeamAverages,
-                       d_blue: int, d_red: int,
-                       social_inc: Dict[int, Dict[str, int]]):
-    """Логирует вклад каждого игрока в игру — для «Игрок дня» и аналитики."""
+# ================= Galleons =================
+def _win_streak_bonus(streak: int) -> int:
+    # 2->+2, 3->+4, 4->+8, 5->+16, 6->+32, 7->+100, >7 -> +100
+    if streak == 2: return 2
+    if streak == 3: return 4
+    if streak == 4: return 8
+    if streak == 5: return 16
+    if streak == 6: return 32
+    if streak >= 7: return 100
+    return 0
+
+def _lose_streak_bonus(streak: int) -> int:
+    # 2 подряд -> +2; 4 -> +4; 6 -> +6; >6 -> каждое следующее поражение +6
+    if streak == 2: return 2
+    if streak == 4: return 4
+    if streak == 6: return 6
+    if streak > 6: return 6
+    return 0
+
+
+async def _apply_galleons_for_game(session: AsyncSession, g: Game, blue: List[Player], red: List[Player], vold: Optional[Player], killer: Optional[Player]) -> None:
+    """Зачисления по правилам:
+       +1 всем за участие; +1 победителям; +3 Воландеморту; +5 убийце Воландеморта;
+       бонус за win-streak по таблице выше; за lose-streak: 2/4/6 на 2/4/6, далее по 6 за каждое поражение (сбрасываем win-streak у проигравших)."""
+    winner = "blue" if (g.result_type or "").startswith("blue_") else "red"
+
+    # +1 участие всем
+    for p in blue + red:
+        p.galleons_balance = int(getattr(p, "galleons_balance", 0)) + 1
+
+    # +3 Voldemort (независимо от исхода)
+    if vold:
+        vold.galleons_balance = int(vold.galleons_balance) + 3
+
+    # +5 убийце (если есть)
+    if killer:
+        killer.galleons_balance = int(killer.galleons_balance) + 5
+
+    # Победители +1, обновление стриков и бонус за винстрик
+    if winner == "blue":
+        winners, losers = blue, red
+    else:
+        winners, losers = red, blue
+
+    for p in winners:
+        p.galleons_balance = int(p.galleons_balance) + 1  # победа
+        p.win_streak = int(getattr(p, "win_streak", 0) or 0) + 1
+        p.lose_streak = 0
+        p.galleons_balance = int(p.galleons_balance) + _win_streak_bonus(p.win_streak)
+
+    for p in losers:
+        p.lose_streak = int(getattr(p, "lose_streak", 0) or 0) + 1
+        p.win_streak = 0
+        p.galleons_balance = int(p.galleons_balance) + _lose_streak_bonus(p.lose_streak)
+
+    await session.commit()
+
+# ================== Apply ratings ==================
+def _append_game_stats(game_id: int, blue: List[Player], red: List[Player], avgs: TeamAverages, d_blue: int, d_red: int, inc: Dict[int, Dict[str, int]]):
+    """Append per-player snapshot into JSON for daily/weekly analytics."""
     payload = _load_json(STATS_LOG_PATH)
     ts = _now_msk().isoformat()
-
-    # для каждого игрока пишем его дельту MMR, сумму соц-полей и средний рейтинг соперников в ЭТОЙ игре
     def social_sum(pid: int) -> int:
-        mp = social_inc.get(pid, {})
-        # соц-очки любых типов: blue/red/vold
-        return int(mp.get("social_blue", 0) + mp.get("social_red", 0) + mp.get("social_vold", 0))
+        return sum(inc.get(pid, {}).values()) if pid in inc else 0
 
     for p in blue:
         payload.append({
@@ -229,7 +225,6 @@ def _append_game_stats(game_id: int,
             "ts": ts,
         })
     for p in red:
-        # красные включают и Воланда — он в red-ростере тоже
         payload.append({
             "game_id": game_id,
             "player_id": p.id,
@@ -241,70 +236,243 @@ def _append_game_stats(game_id: int,
         })
     _save_json(STATS_LOG_PATH, payload)
 
-async def apply_ratings(session: AsyncSession, game_id: int) -> str:
+async def set_team_roster(session: AsyncSession, game_id: int, team: str, player_ids: List[int]) -> None:
+    """Replace team roster for a game."""
+    # remove existing
+    res = await session.execute(select(GameParticipant).where(GameParticipant.game_id == game_id, GameParticipant.team == team))
+    for row in list(res.scalars().all()):
+        await session.delete(row)
+    # add new
+    for pid in player_ids:
+        session.add(GameParticipant(game_id=game_id, player_id=pid, team=team))
+    await session.commit()
+
+async def validate_rosters(*args) -> Tuple[bool, str]:
+    """Проверка составов.
+    Поддерживает оба вызова:
+      1) await validate_rosters(session, game_id)
+      2) await/прямо validate_rosters(blue_list, red_list, vold_player | None)
+    Возвращает (ok: bool, message: str).
     """
-    Применяет MMR/социальные очки согласно результату.
-    Возвращает краткую строку для лога (без «Исход» и «Средний MMR», чтобы не дублировать в bot.py).
-    Параллельно пишет поигровую статистику в game_stats.json.
-    """
+    # Определим форму аргументов
+    if len(args) == 2:
+        session, game_id = args
+        blue, red, vold = await get_team_rosters(session, int(game_id))
+    else:
+        blue, red = args[0], args[1]
+        vold = args[2] if len(args) >= 3 else None
+
+    if not blue or not red:
+        return False, "Добавьте игроков в обе команды."
+    if len(blue) > MAX_BLUE:
+        return False, f"Макс. синих: {MAX_BLUE}"
+    if vold is None:
+        return False, "Выберите Воландеморта."
+    # Воландеморт не должен быть в синей команде
+    if any(p.id == getattr(vold, "id", -1) for p in blue):
+        return False, "Воландеморт не может быть в Ордене Феникса."
+    return True, "Составы корректны."
+
+async def set_voldemort(session: AsyncSession, game_id: int, player_id: Optional[int]) -> None:
     g = await session.get(Game, game_id)
+    if not g:
+        return
+    g.voldemort_id = player_id
+    await session.commit()
+
+async def set_result_type_and_killer(session: AsyncSession, game_id: int, result_type: str, killer_id: Optional[int]) -> None:
+    g = await session.get(Game, game_id)
+    if not g:
+        return
+    g.result_type = result_type
+    g.killer_id = killer_id
+    await session.commit()
+
+async def apply_ratings(session: AsyncSession, game_id: int) -> str:
+    """Main entry: applies MMR/social and galleons for a finished game."""
+    g = await session.get(Game, game_id)
+    if not g or not g.result_type:
+        return "Игра не завершена."
+
     blue, red, vold = await get_team_rosters(session, game_id)
-    if not g.result_type:
-        g.result_type = "blue_laws" if g.winner == "blue" else "red_laws"
-        await session.commit()
-
-    avgs = await _team_avgs(session, blue, red)
-    d_blue, d_red = _mmr_delta(avgs.blue_avg, avgs.red_avg,
-                               "blue" if g.result_type.startswith("blue_") else "red")
-
     killer = await session.get(Player, g.killer_id) if g.killer_id else None
-    inc = _add_social(g.result_type, blue, red, vold, killer)
+    avgs = _team_avgs(blue, red)
 
-    # применяем MMR
+    winner = "blue" if g.result_type.startswith("blue_") else "red"
+    d_blue, d_red = _mmr_delta(avgs.blue_avg, avgs.red_avg, winner)
+
+    # Социальные очки
+    inc = _add_social(g.result_type, blue, red, killer)
+
+    # Применяем MMR
     for p in blue:
-        p.rating += d_blue
+        p.rating = int(p.rating) + d_blue
     for p in red:
-        p.rating += d_red
+        p.rating = int(p.rating) + d_red
 
-    # применяем соц-очки
+    # Применяем соц-очки
     for pid, fields in inc.items():
         pl = await session.get(Player, pid)
-        for field, val in fields.items():
-            setattr(pl, field, getattr(pl, field) + val)
+        for field, v in fields.items():
+            setattr(pl, field, int(getattr(pl, field)) + int(v))
 
     await session.commit()
 
-    # лог в файл для «Игрок дня»
+    # Галлеоны
+    await _apply_galleons_for_game(session, g, blue, red, vold, killer)
+
+    # Лог в файл
     _append_game_stats(game_id, blue, red, avgs, d_blue, d_red, inc)
 
-    # краткое резюме (без дублирующих строк)
-    summary = f"Изменение MMR — Синие: {d_blue}, Красные: {d_red}\n"
-    if g.result_type == "blue_kill" and killer:
-        name = f"{killer.first_name}{(' ' + killer.last_name) if killer.last_name else ''}"
-        summary += f"Киллер Воландеморта: {name} (+1 соц, +1 убийство)\n"
-    return summary
+    fav = "Орден Феникса" if avgs.blue_avg >= avgs.red_avg else "Красные"
+    # Winner & how
+    result = g.result_type or ""
+    side = "Орден Феникса" if result.startswith("blue_") else "Пожиратели"
+    try:
+        nlaws = int(result.split("_", 1)[1])
+    except Exception:
+        nlaws = 5
+    color = "синих" if side == "Орден Феникса" else "красных"
+    head = f"Игра завершена.\nПобеда {side} — выложены {nlaws} {color} законов\n"
+    text = (
+        head +
+        f"Средний MMR — Орден Феникса: {avgs.blue_avg:.1f}, Красные: {avgs.red_avg:.1f}\n"
+        f"Фаворит матча: {fav}\n"
+        f"Изменение MMR — Синие: {d_blue}, Красные: {d_red}"
+    )
+    return text
 
-# ============== Recompute all ==============
+# ============= Recomputation utilities =============
 async def recompute_all_ratings(session: AsyncSession) -> str:
+    """Recompute all MMR & socials from scratch (games in id order)."""
+    # reset ratings + social
     res = await session.execute(select(Player))
     players = list(res.scalars().all())
     for p in players:
-        p.rating = INITIAL_RATING
-        p.blue_wins = 0
-        p.red_wins = 0
-        p.vold_wins = 0
+        p.rating = int(INITIAL_RATING)
         p.social_blue = 0
         p.social_red = 0
         p.social_vold = 0
         p.killer_points = 0
     await session.commit()
 
-    resg = await session.execute(select(Game).order_by(Game.id.asc()))
+    resg = await session.execute(select(Game).where(Game.result_type.is_not(None)).order_by(Game.id.asc()))
     games = list(resg.scalars().all())
-    # при полном пересчёте очищать исторический лог НЕ будем — это аналитика по реальным матчам
     for g in games:
-        if not g.result_type and g.winner in ("blue", "red"):
-            g.result_type = "blue_laws" if g.winner == "blue" else "red_laws"
-            await session.commit()
-        await apply_ratings(session, g.id)
-    return f"Пересчитано игр: {len(games)}, игроков: {len(players)}"
+        # team rosters
+        res_parts = await session.execute(select(GameParticipant).where(GameParticipant.game_id == g.id))
+        parts = list(res_parts.scalars().all())
+        blue_ids = [p.player_id for p in parts if p.team == "blue"]
+        red_ids  = [p.player_id for p in parts if p.team in ("red", "voldemort")]
+        blue, red = [], []
+        if blue_ids:
+            resb = await session.execute(select(Player).where(Player.id.in_(blue_ids)))
+            blue = list(resb.scalars().all())
+        if red_ids:
+            resr = await session.execute(select(Player).where(Player.id.in_(red_ids)))
+            red = list(resr.scalars().all())
+
+        avgs = _team_avgs(blue, red)
+        winner = "blue" if g.result_type.startswith("blue_") else "red"
+        d_blue, d_red = _mmr_delta(avgs.blue_avg, avgs.red_avg, winner)
+        inc = _add_social(g.result_type, blue, red, await session.get(Player, g.killer_id) if g.killer_id else None)
+
+        for p in blue:
+            p.rating = int(p.rating) + d_blue
+        for p in red:
+            p.rating = int(p.rating) + d_red
+        for pid, fields in inc.items():
+            pl = await session.get(Player, pid)
+            for field, v in fields.items():
+                setattr(pl, field, int(getattr(pl, field)) + int(v))
+        await session.commit()
+
+    return f"Пересчитано игр: {len(games)}; игроков: {len(players)}"
+
+async def recompute_all_galleons(session: AsyncSession) -> str:
+    """Full recomputation of galleons & streaks across all finished games, preserving purchases (spendings)."""
+    # reset balances & streaks
+    res = await session.execute(select(Player))
+    players = list(res.scalars().all())
+    for p in players:
+        p.galleons_balance = 0
+        p.win_streak = 0
+        p.lose_streak = 0
+    await session.commit()
+
+    resg = await session.execute(select(Game).where(Game.result_type.is_not(None)).order_by(Game.id.asc()))
+    games = list(resg.scalars().all())
+    for g in games:
+        blue, red, vold = await get_team_rosters(session, g.id)
+        killer = await session.get(Player, g.killer_id) if g.killer_id else None
+        await _apply_galleons_for_game(session, g, blue, red, vold, killer)
+
+    # учтём сделанные покупки как «расходы»
+    from sqlalchemy import select as _select
+    from db import Purchase
+    res = await session.execute(_select(Purchase))
+    all_purchases = list(res.scalars().all())
+    spent_by: Dict[int, int] = {}
+    for pur in all_purchases:
+        spent_by[pur.player_id] = spent_by.get(pur.player_id, 0) + int(pur.cost or 0)
+    for p in players:
+        if p.id in spent_by:
+            p.galleons_balance = int(p.galleons_balance) - int(spent_by[p.id])
+    await session.commit()
+    return f"Пересчитано игр: {len(games)}; игроков: {len(players)}; покупок учтено: {len(all_purchases)}"
+
+# ============= Search helper =============
+async def search_players(session: AsyncSession, query: str) -> List[Player]:
+    """Simple case-insensitive search over first/last/username."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    res = await session.execute(select(Player))
+    players = list(res.scalars().all())
+    def matches(p: Player) -> bool:
+        items = [
+            (p.first_name or "").lower(),
+            (p.last_name or "").lower(),
+            (p.username or "").lower(),
+        ]
+        return any(q in s for s in items)
+    return [p for p in players if matches(p)]
+
+
+# ============= Search helper & streaks =============
+async def get_player_streaks(session: AsyncSession, player_id: int) -> Dict[str, int]:
+    """
+    Возвращает стрики игрока:
+      { 'max_win': N, 'max_lose': X, 'cur_win': N1, 'cur_lose': X1 }
+    Считается по завершённым играм игрока в хронологическом порядке.
+    """
+    res = await session.execute(
+        select(GameParticipant).where(GameParticipant.player_id == player_id).order_by(GameParticipant.game_id.asc())
+    )
+    parts = list(res.scalars().all())
+    if not parts:
+        return {"max_win": 0, "max_lose": 0, "cur_win": 0, "cur_lose": 0}
+
+    seq = []  # True = победа, False = поражение
+    for gp in parts:
+        g = await session.get(Game, gp.game_id)
+        if not g or not g.result_type:
+            continue
+        winner = "blue" if g.result_type.startswith("blue_") else "red"
+        side = "blue" if gp.team == "blue" else "red"  # 'red' включает и 'voldemort'
+        seq.append(side == winner)
+
+    cur_w = cur_l = max_w = max_l = 0
+    for win in seq:
+        if win:
+            cur_w += 1
+            cur_l = 0
+            if cur_w > max_w:
+                max_w = cur_w
+        else:
+            cur_l += 1
+            cur_w = 0
+            if cur_l > max_l:
+                max_l = cur_l
+
+    return {"max_win": max_w, "max_lose": max_l, "cur_win": cur_w, "cur_lose": cur_l}
