@@ -1,29 +1,12 @@
-# Python
+cat >> .gitignore << 'EOF'
+.venv/
+venv/
+ENV/
+
+
+__pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg-info/
-*.egg
+
 .env
-.env.*
-.env.local
-
-# IDE/OS
-.vscode/
-.idea/
-.DS_Store
-
-# Logs, cache
-*.log
-.cache/
-dist/
-build/
-
-# Docker/Compose
-*.local.yml
-
-# secrets
-.env
-.env.*
-Bot Token.txt
+Бекапы/
+EOF
