@@ -102,11 +102,11 @@ def is_admin(user_id: int, username: Optional[str]) -> bool:  # type: ignore[ove
 COIN = "💰"
 
 SHOP_ITEMS = [
-    {"code": "pm_first_game", "label": "Заявиться первым министром в 1-й игре", "title": "Заявиться первым министром в первой игре вечера (до раздачи ролей)", "cost": 5, "emoji": "👑"},
-    {"code": "pm_replace_lord", "label": "Заявиться первым министром (смещение лорда)", "title": "Заявиться первым министром сместив прошлого лорда", "cost": 15, "emoji": "🛡️"},
-    {"code": "badge", "title": "Фирменный значок", "cost": 100, "emoji": "🏷️"},
-    {"code": "random_12_rooms", "title": "Случайный сертификат 12 комнат", "cost": 300, "emoji": "🎟️"},
-    {"code": "named_ballot", "title": "Именная голосовалка", "cost": 300, "emoji": "🗳️"},
+    {"code": "pm_first_game", "label": "Первый министр (1-я игра)", "title": "Заявиться первым министром в первой игре вечера (до раздачи ролей)", "cost": 5, "emoji": "👑"},
+    {"code": "pm_replace_lord", "label": "Первый министр (смещение)", "title": "Заявиться первым министром сместив прошлого лорда", "cost": 15, "emoji": "🛡️"},
+    {"code": "badge", "label": "Фирменный значок", "title": "Фирменный значок", "cost": 100, "emoji": "🏷️"},
+    {"code": "random_12_rooms", "label": "Сертификат 12 комнат", "title": "Случайный сертификат 12 комнат", "cost": 300, "emoji": "🎟️"},
+    {"code": "named_ballot", "label": "Именная голосовалка", "title": "Именная голосовалка", "cost": 300, "emoji": "🗳️"},
 ]
 
 def _msk_now_str() -> str:
@@ -480,9 +480,8 @@ def home_kb_for_user(is_admin_flag: bool, is_authorized: bool):
     kb.button(text="🧩 Игрок дня", callback_data="playeroftheday")
     kb.button(text="🏆 Рейтинг игроков", callback_data="rating:menu")
     if is_authorized:
-        kb.button(text="📊 Моя статистика", callback_data="me:stats")
+        kb.button(text="📈 Моя статистика", callback_data="me:stats")
         kb.button(text=f"{COIN} Мои Галлеоны", callback_data="me:galleons")
-        kb.button(text="📈 Win/lose-streak", callback_data="me:streak")
         kb.button(text="🛒 Лавка Олливандера", callback_data="shop:menu")
         kb.button(text="🧾 Мои покупки", callback_data="mypur:menu")
     kb.button(text="❓ FAQ", callback_data="faq")
@@ -701,6 +700,7 @@ FAQ_TEXT = (
 - Если игрок убивает Воландеморта — ещё 5 монет сверху (в итоге 1 за участие + 1 за победу + 5 за убийство)
 
 "Винстрик"
+- Определение: <i>винстрик — это количество побед подряд</i>. После первой победы лузстрик сбрасывается в 0, а активный винстрик становится 1.
 - Если игрок побеждает 2 раза подряд — ему зачисляется на баланс 2 монеты (просто добавляется 2 монеты к его балансу)
 - Если игрок побеждает 3 раза подряд — ему зачисляется на баланс 4 монеты
 - Если игрок побеждает 4 раза подряд — ему зачисляется на баланс 8 монет
@@ -710,6 +710,7 @@ FAQ_TEXT = (
 Если игрок продолжает побеждать без поражений, ему зачисляется по 100 монет сверху за каждую победу (плюс стандартные +1 за участие и +1 за победу).
 
 "Лузстрик"
+- Определение: <i>лузстрик — это количество поражений подряд</i>. После первого поражения винстрик сбрасывается в 0, а активный лузстрик становится 1.
 - Если игрок проигрывает 2 раза подряд — ему зачисляется на баланс 2 монеты
 - Если игрок проигрывает 4 раза подряд — ему зачисляется на баланс 4 монеты
 - Если игрок проигрывает 6 раз подряд — ему зачисляется на баланс 6 монет
@@ -1215,17 +1216,24 @@ async def set_result(c: CallbackQuery, state: FSMContext):
         summary = _normalize_summary_delta(summary)
         summary = _strip_repeat_summary(summary)
         summary = _strip_repeat_summary(summary)
-        blue, red, _ = await get_team_rosters(session, game_id)
+        blue, red, vold = await get_team_rosters(session, game_id)
+        # include Voldemort into red side for averages
+        red_ext = list(red)
+        if vold and all(p.id != vold.id for p in red_ext):
+            red_ext.append(vold)
         b_avg = round(sum(p.rating for p in blue) / max(1, len(blue)), 1)
-        r_avg = round(sum(p.rating for p in red) / max(1, len(red)), 1)
-        hum = RESULT_HUMAN.get(result_type, result_type)
+        red_ext = list(red)
+        if vold and all(p.id != vold.id for p in red_ext):
+            red_ext.append(vold)
+        r_avg = round(sum(p.rating for p in red_ext) / max(1, len(red_ext)), 1)
         fav = favorite_side(b_avg, r_avg)
         metric_inc("games_finished")
 
+    human = RESULT_HUMAN.get(result_type, "Исход не указан")
     await safe_edit(
         c.message,
         f"Игра завершена.\n"
-        f"{hum}\n"
+        f"{human}\n"
         f"Средний MMR — Орден Феникса: {b_avg}, Пожиратели: {r_avg}\n"
         f"Фаворит матча: {fav}\n"
         f"{summary}",
@@ -1244,9 +1252,13 @@ async def picked_killer(c: CallbackQuery, state: FSMContext):
         summary = await apply_ratings(session, game_id)
         summary = _normalize_summary_delta(summary)
         summary = _normalize_summary_delta(summary)
-        blue, red, _ = await get_team_rosters(session, game_id)
+        blue, red, vold = await get_team_rosters(session, game_id)
+        # include Voldemort into red side for averages
+        red_ext = list(red)
+        if vold and all(p.id != vold.id for p in red_ext):
+            red_ext.append(vold)
         b_avg = round(sum(p.rating for p in blue) / max(1, len(blue)), 1)
-        r_avg = round(sum(p.rating for p in red) / max(1, len(red)), 1)
+        r_avg = round(sum(p.rating for p in red_ext) / max(1, len(red_ext)), 1)
         fav = favorite_side(b_avg, r_avg)
         metric_inc("games_finished")
 
@@ -1294,6 +1306,8 @@ async def rating_export(c: CallbackQuery, state: FSMContext):
     from openpyxl import Workbook
 
     async with Session() as session:
+        from services import recompute_win_counters
+        await recompute_win_counters(session)
         res = await session.execute(
             select(Player).order_by(Player.rating.desc(), Player.first_name.asc(), Player.last_name.asc())
         )
@@ -1305,22 +1319,9 @@ async def rating_export(c: CallbackQuery, state: FSMContext):
         wb = Workbook()
         ws = wb.active
         ws.title = "Рейтинг"
-        ws.append(
-            [
-                "#", "Имя", "Фамилия", "MMR",
-                "Всего побед за синих", "Всего побед за красных", "Всего побед за Воланда",
-                "Всего очков за Орден Феникса", "Всего очков за Пожирателей", "Всего очков за Воландеморта",
-                "Киллы Воланда"
-            ]
-        )
+        ws.append(["#", "Имя", "Фамилия", "MMR", "Победы Ордена", "Победы Пожирателей (вкл. Воландеморта)", "Директором избран Воландеморт", "Игрок отправил Воландеморта в Азкабан"])
         for i, p in enumerate(players, start=1):
-            ws.append(
-                [
-                    i, p.first_name, p.last_name or "", p.rating,
-                    p.blue_wins, p.red_wins, p.vold_wins,
-                    p.social_blue, p.social_red, p.social_vold, p.killer_points
-                ]
-            )
+            ws.append([i, p.first_name, (p.last_name or ""), int(p.rating), int(getattr(p, "blue_wins", 0) or 0), int(getattr(p, "red_wins", 0) or 0) + int(getattr(p, "vold_wins", 0) or 0), int(getattr(p, "social_vold", 0) or 0), int(getattr(p, "killer_points", 0) or 0)])
         wb.save(file_path)
         await c.message.answer_document(FSInputFile(file_path), caption="Экспорт рейтинга (Excel)")
         await safe_answer(c, "Файл готов.")
@@ -1514,7 +1515,9 @@ async def finished_result(c: CallbackQuery):
     gid = int(c.data.split(":")[2])
     async with Session() as session:
         g = await get_game(session, gid)
-        blue, red, _ = await get_team_rosters(session, gid)
+        blue, red, vold = await get_team_rosters(session, gid)
+        if not vold and getattr(g, "voldemort_id", None):
+            vold = await session.get(Player, g.voldemort_id)
         b_avg = round(sum(p.rating for p in blue) / max(1, len(blue)), 1)
         r_avg = round(sum(p.rating for p in red) / max(1, len(red)), 1)
         fav = favorite_side(b_avg, r_avg)
@@ -1527,7 +1530,7 @@ async def finished_result(c: CallbackQuery):
     txt = (
         f"Игра ID {gid}: {getattr(g,'title','')}\n\n"
         f"🟦 Орден Феникса ({len(blue)}):\n{blue_txt}\n\n"
-        f"🟪 Пожиратели + Воландеморт ({len(red)}):\n{red_txt}\n\n"
+        f"🟪 Пожиратели + Воландеморт ({len(red)}):\n{red_txt}\n" + ("" if not vold else f"Воландеморт: {full_name(vold)} [{getattr(vold, 'rating', '—')}]\n") + "\n"
         f"Результат: {human}\n"
         f"Средний MMR — Орден Феникса: {b_avg}, Пожиратели: {r_avg}\n"
         f"Фаворит матча: {fav}\n"
@@ -1757,17 +1760,42 @@ async def admin_game_delete(c: CallbackQuery, state: FSMContext):
     else:
         await safe_edit(c.message, "Игр больше нет.", reply_markup=admin_menu_kb())
 
+
 @dp.callback_query(F.data == "admin:recompute")
 async def admin_recompute(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
     if not is_admin(c.from_user.id, c.from_user.username):
         await safe_answer(c, "Только для админов.", show_alert=True); return
+    from services import recompute_win_counters
     async with Session() as session:
         summary = await recompute_all_ratings(session)
+        await recompute_win_counters(session)
     await safe_edit(c.message, f"✅ Пересчёт завершён.\n{summary}", reply_markup=admin_menu_kb())
+
+    # Автоэкспорт Excel с актуальными данными
+    from openpyxl import Workbook
+    from sqlalchemy import select
+    import tempfile, os
+    async with Session() as session2:
+        res2 = await session2.execute(select(Player).order_by(Player.rating.desc(), Player.first_name.asc(), Player.last_name.asc()))
+        players2 = list(res2.scalars().all())
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    file_path = tmp.name; tmp.close()
+    try:
+        wb = Workbook(); ws = wb.active; ws.title = "Рейтинг"
+        ws.append(["#", "Имя", "Фамилия", "MMR", "Победы Ордена", "Победы Пожирателей (вкл. Воландеморта)", "Директором избран Воландеморт", "Игрок отправил Воландеморта в Азкабан"])
+        for i, p in enumerate(players2, start=1):
+            blue = int(getattr(p, 'blue_wins', 0) or 0)
+            red  = int(getattr(p, 'red_wins', 0) or 0)
+            vold = int(getattr(p, 'vold_wins', 0) or 0)
+            ws.append([i, p.first_name, (p.last_name or ""), int(p.rating), int(getattr(p, "blue_wins", 0) or 0), int(getattr(p, "red_wins", 0) or 0) + int(getattr(p, "vold_wins", 0) or 0), int(getattr(p, "social_vold", 0) or 0), int(getattr(p, "killer_points", 0) or 0)])
+        wb.save(file_path)
+        await c.message.answer_document(FSInputFile(file_path), caption="Экспорт рейтинга (Excel)")
+    finally:
+        try: os.remove(file_path)
+        except Exception: pass
+
     await safe_answer(c, "Рейтинг пересчитан.")
-
-
 @dp.callback_query(F.data == "admin:info")
 async def admin_info(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)
@@ -1926,33 +1954,195 @@ async def my_stats(c: CallbackQuery, state: FSMContext):
     pid = get_player_id_for_user(c.from_user.id)
     if not pid:
         await safe_answer(c, "Вы не авторизованы.", show_alert=True); return
+
     async with Session() as session:
         me = await session.get(Player, pid)
         if not me:
             await safe_answer(c, "Игрок не найден. Обратитесь к администратору.", show_alert=True); return
-        res_all = await session.execute(select(Player).order_by(Player.rating.desc(), Player.first_name.asc()))
+
+        # --- Overall ranks (оставляем как было) ---
+        res_all = await session.execute(select(Player).order_by(Player.rating.desc(), Player.first_name.asc(), Player.last_name.asc()))
         players = list(res_all.scalars().all())
+
         def rank_by(key):
             arr = sorted(players, key=key, reverse=True)
             for idx, p in enumerate(arr, 1):
                 if p.id == me.id:
                     return idx, len(arr)
             return None, len(arr)
+
         r_mmr, total = rank_by(lambda p: p.rating)
         r_blue, _ = rank_by(lambda p: p.social_blue)
-        r_red, _ = rank_by(lambda p: p.social_red)
+        r_red, _  = rank_by(lambda p: p.social_red)
         r_vold, _ = rank_by(lambda p: p.social_vold)
         r_kill, _ = rank_by(lambda p: p.killer_points)
 
+        # --- Streaks ---
+        s = await get_player_streaks(session, pid)
+
+        # =======================
+        # 1) Совместная статистика с игроками (за ВСЕ игры) — только игры, где были в ОДНОЙ команде.
+        #    Пожиратели и Воландеморт считаются одной стороной ("red").
+        # =======================
+        from sqlalchemy import select as _select
+        resg = await session.execute(_select(Game).where(Game.result_type.is_not(None)).order_by(Game.id.asc()))
+        all_games = list(resg.scalars().all())
+
+        co_stats_all = {}  # pid -> {'games': int, 'wins': int}
+        co_ids_all = set()
+
+        for g in all_games:
+            # Получаем составы
+            resp = await session.execute(_select(GameParticipant).where(GameParticipant.game_id == g.id))
+            parts = list(resp.scalars().all())
+            blue_ids = [gp.player_id for gp in parts if gp.team == 'blue']
+            red_ids  = [gp.player_id for gp in parts if gp.team == 'red']
+            vold_ids = [gp.player_id for gp in parts if gp.team == 'voldemort']
+            vold_id  = g.voldemort_id or (vold_ids[0] if vold_ids else None)
+
+            # Расширяем красную сторону Воландемортом
+            red_ext = list(red_ids)
+            if vold_id and vold_id not in red_ext:
+                red_ext.append(vold_id)
+
+            # Определяем сторону текущего пользователя в этой игре
+            my_side = None
+            if pid in blue_ids:
+                my_side = 'blue'
+            elif pid in red_ext:
+                my_side = 'red'
+            else:
+                continue  # не участвовал
+
+            winner = 'blue' if (g.result_type or '').startswith('blue_') else 'red'
+
+            # Список тиммейтов (только одна сторона со мной)
+            same_side_ids = blue_ids if my_side == 'blue' else red_ext
+            for cid in same_side_ids:
+                if cid == pid:
+                    continue
+                co_ids_all.add(cid)
+                st = co_stats_all.get(cid, {'games': 0, 'wins': 0})
+                st['games'] += 1
+                if winner == my_side:
+                    st['wins'] += 1
+                co_stats_all[cid] = st
+
+        # Разрешаем имена для ко-игроков
+        co_names_all = {}
+        if co_ids_all:
+            resp2 = await session.execute(_select(Player).where(Player.id.in_(list(co_ids_all))))
+            for p2 in resp2.scalars().all():
+                nm = f"{p2.first_name}{(' ' + p2.last_name) if p2.last_name else ''}"
+                co_names_all[p2.id] = nm
+
+        def win_pct_all(pid_):
+            st = co_stats_all.get(pid_, {'games': 0, 'wins': 0})
+            if st['games'] == 0:
+                return 0.0
+            return (st['wins'] / st['games']) * 100.0
+
+        def loss_pct_all(pid_):
+            st = co_stats_all.get(pid_, {'games': 0, 'wins': 0})
+            if st['games'] == 0:
+                return 0.0
+            losses = st['games'] - st['wins']
+            return (losses / st['games']) * 100.0
+
+        def sort_key_for_top(lst_fn_pct, pid_):
+            # сортируем по проценту (убыв.), затем по совместным играм (убыв.), затем по имени (возр.)
+            pct = lst_fn_pct(pid_)
+            games_cnt = co_stats_all.get(pid_, {}).get('games', 0)
+            name = co_names_all.get(pid_, "")
+            return (-pct, -games_cnt, name)
+
+        co_list_all = list(co_stats_all.keys())
+        top_win_all  = sorted(co_list_all, key=lambda x: sort_key_for_top(win_pct_all, x))[:5]
+        top_lose_all = sorted(co_list_all, key=lambda x: sort_key_for_top(loss_pct_all, x))[:5]
+
+        def fmt_top_all(lst, pct_fn):
+            if not lst:
+                return "—"
+            out = []
+            for idx, pid2 in enumerate(lst, 1):
+                name = co_names_all.get(pid2, f"ID {pid2}")
+                st = co_stats_all.get(pid2, {'games': 0, 'wins': 0})
+                out.append(f"{idx}. {name} — {pct_fn(pid2):.0f}% (совм. игр: {st['games']})")
+            return "\n".join(out)
+
+        top_win_block = fmt_top_all(top_win_all, win_pct_all)
+        top_lose_block = fmt_top_all(top_lose_all, loss_pct_all)
+
+        # =======================
+        # 2) Блок "последние 10 игр" — переносим в самый низ.
+        # =======================
+        # собираем ID игр, где участвовал пользователь
+        resp = await session.execute(_select(GameParticipant.game_id).where(GameParticipant.player_id == pid))
+        gp_ids = set(resp.scalars().all())
+        resv = await session.execute(_select(Game.id).where(Game.voldemort_id == pid))
+        v_ids = set(resv.scalars().all())
+        all_ids = list(gp_ids | v_ids)
+        last_games = []
+        if all_ids:
+            resg10 = await session.execute(
+                _select(Game).where(Game.id.in_(all_ids), Game.result_type.is_not(None)).order_by(Game.id.desc()).limit(10)
+            )
+            last_games = list(resg10.scalars().all())
+
+        blue_wins = blue_losses = red_wins = red_losses = 0
+        game_lines = []
+
+        for g in last_games:
+            parts_res = await session.execute(_select(GameParticipant).where(GameParticipant.game_id == g.id))
+            parts = list(parts_res.scalars().all())
+            blue_ids = [gp.player_id for gp in parts if gp.team == 'blue']
+            red_ids  = [gp.player_id for gp in parts if gp.team == 'red']
+            vold_ids = [gp.player_id for gp in parts if gp.team == 'voldemort']
+            vold_id  = g.voldemort_id or (vold_ids[0] if vold_ids else None)
+
+            red_ext = list(red_ids)
+            if vold_id and vold_id not in red_ext:
+                red_ext.append(vold_id)
+
+            side = 'blue' if pid in blue_ids else ('red' if pid in red_ext else None)
+            winner = 'blue' if (g.result_type or '').startswith('blue_') else 'red'
+
+            if side == 'blue':
+                if winner == 'blue': blue_wins += 1
+                else: blue_losses += 1
+            elif side == 'red':
+                if winner == 'red': red_wins += 1
+                else: red_losses += 1
+
+            ts = getattr(g, "created_at", None)
+            ts_str = ts.strftime("%d.%m.%Y %H:%M") if ts else getattr(g, "title", f"Игра {g.id}")
+            side_h = "Орден" if side == 'blue' else ("Пожиратели" if side == 'red' else "—")
+            outcome_h = "Победа" if side and winner == side else "Поражение"
+            game_lines.append(f"• {ts_str} — ID {g.id} — {side_h} — {outcome_h}")
+
     admin = is_admin(c.from_user.id, c.from_user.username)
+
+    # Формируем текст: сначала сводные показатели, затем «ТОПы», и в самый низ — последние 10 игр.
+    n_last = len(game_lines)
+    last_hdr = f"За последние {n_last} игр:" if n_last else "За последние 0 игр:"
+    last_lines = "\n".join(game_lines)
+
     text = (
-        f"📊 *Моя статистика*\n\n"
+        f"📈 *Моя статистика*\n\n"
         f"MMR: *{me.rating}*  _(место: {r_mmr}/{total})_\n"
-        f"Лучшие синие — очков: *{me.social_blue}*  _(место: {r_blue})_\n"
-        f"Лучшие пожиратели — очков: *{me.social_red}*  _(место: {r_red})_\n"
-        f"Лучшие Воландеморты — очков: *{me.social_vold}*  _(место: {r_vold})_\n"
-        f"Киллеры Воланда — убийств: *{me.killer_points}*  _(место: {r_kill})_"
+        f"Орден — соц очки: *{me.social_blue}*  _(место: {r_blue})_\n"
+        f"Пожиратели — соц очки: *{me.social_red}*  _(место: {r_red})_\n"
+        f"Воландеморт — соц очки: *{me.social_vold}*  _(место: {r_vold})_\n"
+        f"Киллер Воландеморта — убийств: *{me.killer_points}*  _(место: {r_kill})_\n\n"
+        f"Винстрики: winstreak *{s['cur_win']}* (макс: {s['max_win']}), losestreak *{s['cur_lose']}* (макс: {s['max_lose']})\n\n"
+        f"*Наибольший процент побед с игроками (за все игры):*\n{top_win_block}\n\n"
+        f"*Наибольший процент поражений с игроками (за все игры):*\n{top_lose_block}\n\n"
+        f"*{last_hdr}*\n"
+        f"{last_lines}\n\n"
+        f"Побед за Орден Феникса: *{blue_wins}*, Поражений: *{blue_losses}*\n"
+        f"Побед за Пожирателей: *{red_wins}*, Поражений: *{red_losses}*"
     )
+
     await safe_edit(
         c.message,
         text,
@@ -1962,8 +2152,6 @@ async def my_stats(c: CallbackQuery, state: FSMContext):
     await safe_answer(c, )
 
 
-
-# --- Win/Lose Streaks ---
 @dp.callback_query(F.data == "me:streak")
 async def me_streak(c: CallbackQuery, state: FSMContext):
     metric_click(c.from_user.id)

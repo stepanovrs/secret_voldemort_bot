@@ -43,6 +43,11 @@ class Player(Base):
 
     killer_points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # --- ГАЛЛЕОНЫ и стрики ---
+    galleons_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    win_streak: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lose_streak: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -88,6 +93,23 @@ class GameParticipant(Base):
     player: Mapped["Player"] = relationship(back_populates="participants")
 
 
+
+class Purchase(Base):
+    __tablename__ = "purchases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    player_id: Mapped[int] = mapped_column(ForeignKey("players.id", ondelete="CASCADE"), index=True)
+    item_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    cost: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_received: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 0/1
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(MSK),
+        server_default=func.now(),
+    )
+
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 Session: async_sessionmaker[AsyncSession] = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -99,6 +121,19 @@ def now_msk() -> datetime:
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # --- lightweight migrations for new columns (SQLite) ---
+        try:
+            await conn.exec_driver_sql("ALTER TABLE players ADD COLUMN galleons_balance INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await conn.exec_driver_sql("ALTER TABLE players ADD COLUMN win_streak INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await conn.exec_driver_sql("ALTER TABLE players ADD COLUMN lose_streak INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
 
 
 # ===== CRUD =====
@@ -198,3 +233,29 @@ async def fetch_participants(session: AsyncSession, game_id: int) -> Tuple[List[
     blues.sort(key=lambda p: (p.first_name, p.last_name or ""))
     reds.sort(key=lambda p: (p.first_name, p.last_name or ""))
     return blues, reds
+
+
+# ===== Purchases API =====
+async def create_purchase(session: AsyncSession, player_id: int, item_code: str, title: str, cost: int) -> Purchase:
+    p = Purchase(player_id=player_id, item_code=item_code, title=title, cost=cost, is_received=0)
+    session.add(p)
+    await session.commit()
+    await session.refresh(p)
+    return p
+
+async def list_purchases(session: AsyncSession, player_id: int) -> List[Purchase]:
+    res = await session.execute(select(Purchase).where(Purchase.player_id == player_id).order_by(Purchase.created_at.desc()))
+    return list(res.scalars().all())
+
+async def set_purchase_received(session: AsyncSession, purchase_id: int, received: bool) -> bool:
+    p = await session.get(Purchase, purchase_id)
+    if not p:
+        return False
+    p.is_received = 1 if received else 0
+    await session.commit()
+    return True
+
+async def sum_spent_by_player(session: AsyncSession, player_id: int) -> int:
+    res = await session.execute(select(func.sum(Purchase.cost)).where(Purchase.player_id == player_id))
+    total = res.scalar() or 0
+    return int(total)

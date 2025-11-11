@@ -4,8 +4,25 @@ from __future__ import annotations
 import os
 from typing import Set
 from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+ENV_PATH = (Path(__file__).parent / ".env").resolve()
+load_dotenv(ENV_PATH, override=True)
+
+
+# --- helpers ---
+def env_bool(name: str, default: bool=False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in {"1","true","yes","y","on"}:
+        return True
+    if s in {"0","false","no","n","off"}:
+        return False
+    return default
 
 # === базовые настройки ===
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
@@ -56,3 +73,23 @@ def is_admin(user_id: int | None, username: str | None) -> bool:
         if username.lstrip("@").lower() in ADMIN_USERNAMES:
             return True
     return False
+
+
+# В тестовом боте включаем кнопку «Создать игрока», в проде — выключаем
+ENABLE_ADMIN_CREATE_PLAYER: bool = env_bool("ENABLE_ADMIN_CREATE_PLAYER", default=True)
+
+
+# helpers
+
+def env_bool(name: str, default: bool=False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in {"1","true","yes","y","on"}:
+        return True
+    if s in {"0","false","no","n","off"}:
+        return False
+    return default
